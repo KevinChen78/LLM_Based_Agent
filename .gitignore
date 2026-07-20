@@ -1,0 +1,19 @@
+build/
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sln
+*.vcxproj*
+CMakeSettings.json
+out/
+logs/
+data/
+ftp_root/
+.DS_Store
+*.log
+
+# Secrets — local LLM credentials, never commit
+llm_gateway/.env.local
+llm_gateway/.env

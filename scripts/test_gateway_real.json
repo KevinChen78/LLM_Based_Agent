@@ -1,0 +1,1 @@
+{"model":"deepseek-v4-flash","temperature":0.3,"messages":[{"role":"system","content":"You are a task planner for a group-buying recommendation agent. Output ONLY valid JSON."},{"role":"user","content":"# 用户当前输入\n今晚三个人吃海鲜，预算300左右，上海\n\n请直接输出 JSON，包含字段 action（clarify|retrieve|respond）、slots、missing_slots、clarification_question、tool_calls。"}]}

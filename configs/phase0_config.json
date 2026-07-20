@@ -1,0 +1,23 @@
+# Phase 0 配置
+{
+    "llm": {
+        "base_url": "http://localhost:8000",
+        "api_key": "",
+        "default_model": "gpt-4o-mini",
+        "timeout_ms": 3000,
+        "max_retries": 1
+    },
+    "server": {
+        "host": "0.0.0.0",
+        "port": 8080,
+        "thread_pool_size": 4
+    },
+    "session": {
+        "ttl_hours": 72,
+        "max_history_turns": 10
+    },
+    "retrieval": {
+        "default_top_k": 20,
+        "rank_top_n": 3
+    }
+}
