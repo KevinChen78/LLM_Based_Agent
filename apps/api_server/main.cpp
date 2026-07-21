@@ -9,6 +9,7 @@
 #include "agent/deal_tools.hpp"
 #include "agent/llm_client.hpp"
 #include "agent/response_composer.hpp"
+#include "agent/retrieval_client.hpp"
 #include "agent/safety_guard.hpp"
 #include "agent/session_memory.hpp"
 #include "agent/sse_stream_emitter.hpp"
@@ -89,6 +90,10 @@ json ToJson(const RecommendationResult& r) {
         ji["tags"] = item.tags;
         j["items"].push_back(ji);
     }
+    // RAG grounding passages (only present when kb_search ran).
+    if (!r.grounding.empty()) {
+        j["grounding"] = r.grounding;
+    }
     return j;
 }
 
@@ -114,10 +119,26 @@ int main() {
     const char* catalog_env = std::getenv("DEALS_CATALOG_PATH");
     std::string catalog_path = catalog_env ? catalog_env : "data/deals.json";
     auto catalog = std::make_shared<DealCatalog>(catalog_path);
-    tools->Register(std::make_shared<DealRetriever>(catalog));
+    // Retrieval service (BM25 over deals + knowledge base). Enabled by setting
+    //   RETRIEVAL_SERVICE_URL=http://localhost:8001
+    // When set: DealRetriever delegates text ranking to BM25 and the kb_search
+    // tool becomes available for knowledge-base RAG. When empty, both degrade
+    // to the local substring retriever and no KB — offline behaviour unchanged.
+    const char* retr_env = std::getenv("RETRIEVAL_SERVICE_URL");
+    std::string retr_url = retr_env ? retr_env : "";
+    auto retrieval = std::make_shared<RetrievalClient>(retr_url);
+    tools->Register(std::make_shared<DealRetriever>(catalog, retrieval));
     tools->Register(std::make_shared<DealRanker>());
     std::cout << "Retrieval backend: Catalog (" << catalog_path
               << ", " << catalog->Size() << " deals)" << std::endl;
+    if (retrieval->Enabled()) {
+        tools->Register(std::make_shared<KnowledgeRetriever>(retrieval));
+        bool up = retrieval->Healthy();
+        std::cout << "Retrieval service: " << retr_url << " (BM25 deals + kb_search)"
+                  << (up ? "" : " [unreachable — will degrade to local]") << std::endl;
+    } else {
+        std::cout << "Retrieval service: disabled (set RETRIEVAL_SERVICE_URL to enable BM25 + kb_search)" << std::endl;
+    }
     // Session storage: SQLite (persistent) by default, InMemory fallback.
     //   SESSION_STORE=sqlite|memory   (default sqlite)
     //   SESSION_DB_PATH=data/sessions.db

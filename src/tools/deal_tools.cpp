@@ -92,8 +92,10 @@ std::pair<int, int> KeywordMatch(const nlohmann::json& deal,
 // DealRetriever
 // ---------------------------------------------------------------------------
 
-DealRetriever::DealRetriever(std::shared_ptr<DealCatalog> catalog)
-    : catalog_(std::move(catalog)) {}
+DealRetriever::DealRetriever(std::shared_ptr<DealCatalog> catalog,
+                             std::shared_ptr<RetrievalClient> retrieval)
+    : catalog_(std::move(catalog))
+    , retrieval_(std::move(retrieval)) {}
 
 std::string DealRetriever::SchemaJson() const {
     return R"({
@@ -131,6 +133,45 @@ coro::Task<ToolResult> DealRetriever::Execute(const ToolCall& call) {
         std::string keywords = args.value("keywords", "");
         int top_k = args.value("top_k", 20);
         if (top_k <= 0) top_k = 20;
+
+        // Optional BM25 semantic retrieval via the retrieval service. When the
+        // service is configured and healthy we delegate the text-relevance
+        // ranking to it (better synonym / colloquial matching) and return its
+        // ordering directly; on any failure we fall through to the local
+        // substring matcher below so offline behaviour is unchanged.
+        if (retrieval_ && retrieval_->Enabled() && retrieval_->Healthy()) {
+            nlohmann::json body;
+            body["query"] = keywords;
+            if (!city.empty()) body["city"] = city;
+            if (!category.empty()) body["category"] = category;
+            if (!district.empty()) body["district"] = district;
+            if (max_price < 1e9) body["max_price"] = max_price;
+            if (min_price > 0.0) body["min_price"] = min_price;
+            if (people > 0) body["people"] = people;
+            body["top_k"] = top_k;
+
+            if (auto resp = retrieval_->SearchDeals(body)) {
+                nlohmann::json out_items = nlohmann::json::array();
+                for (auto& item : resp->value("items", nlohmann::json::array())) {
+                    if (!item.contains("reason") || item["reason"].get<std::string>().empty()) {
+                        item["reason"] = BuildReason(item);
+                    }
+                    out_items.push_back(item);
+                }
+                result.success = true;
+                nlohmann::json out;
+                out["items"] = out_items;
+                out["total"] = resp->contains("total")
+                    ? (*resp)["total"]
+                    : nlohmann::json(out_items.size());
+                result.result_json = out.dump();
+                spdlog::info("deal_retriever(BM25): query='{}' city={} -> {}/{} matched",
+                             keywords, city, out_items.size(),
+                             out["total"].get<long>());
+                co_return result;
+            }
+            spdlog::warn("deal_retriever: BM25 service failed, falling back to local match");
+        }
 
         auto tokens = Tokenize(keywords);
 
@@ -292,6 +333,65 @@ coro::Task<ToolResult> DealRanker::Execute(const ToolCall& call) {
     } catch (const std::exception& e) {
         result.success = false;
         result.error_message = std::string("deal_ranker error: ") + e.what();
+    }
+
+    co_return result;
+}
+
+// ---------------------------------------------------------------------------
+// KnowledgeRetriever (kb_search)
+// ---------------------------------------------------------------------------
+
+KnowledgeRetriever::KnowledgeRetriever(std::shared_ptr<RetrievalClient> retrieval)
+    : retrieval_(std::move(retrieval)) {}
+
+std::string KnowledgeRetriever::SchemaJson() const {
+    return R"({
+        "name": "kb_search",
+        "description": "检索团购知识库，返回与问题相关的知识段落（发票/预约/退款/包间/停车/忌口/营业时间等），作为回答的事实依据",
+        "parameters": {
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {"type": "string", "description": "用户的问题或关键词，如 能不能开发票、有没有包间"},
+                "top_k": {"type": "integer", "default": 3}
+            }
+        }
+    })";
+}
+
+coro::Task<ToolResult> KnowledgeRetriever::Execute(const ToolCall& call) {
+    ToolResult result;
+    result.call_id = call.call_id;
+
+    try {
+        auto args = nlohmann::json::parse(call.arguments_json);
+        std::string query = args.value("query", "");
+        int top_k = args.value("top_k", 3);
+        if (top_k <= 0) top_k = 3;
+
+        if (!retrieval_ || !retrieval_->Enabled()) {
+            result.success = false;
+            result.error_message = "kb_search: retrieval service not configured";
+            co_return result;
+        }
+
+        auto resp = retrieval_->SearchKb(query, top_k);
+        if (!resp) {
+            result.success = false;
+            result.error_message = "kb_search: retrieval service unavailable";
+            co_return result;
+        }
+
+        result.success = true;
+        nlohmann::json out;
+        out["passages"] = resp->value("passages", nlohmann::json::array());
+        result.result_json = out.dump();
+        spdlog::info("kb_search: query='{}' -> {} passages",
+                     query, out["passages"].size());
+    } catch (const std::exception& e) {
+        result.success = false;
+        result.error_message = std::string("kb_search error: ") + e.what();
     }
 
     co_return result;

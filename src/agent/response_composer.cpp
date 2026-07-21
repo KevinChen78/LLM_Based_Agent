@@ -153,7 +153,8 @@ coro::Task<RecommendationResult> ResponseComposer::Compose(
     const std::string& user_request,
     const nlohmann::json& slots,
     const std::vector<RecommendationItem>& items,
-    std::shared_ptr<StreamEmitter> emitter) {
+    std::shared_ptr<StreamEmitter> emitter,
+    const std::string& grounding) {
     RecommendationResult result;
     result.items = items;   // copy; LLM may enrich per-item reasons in place
 
@@ -175,7 +176,7 @@ coro::Task<RecommendationResult> ResponseComposer::Compose(
         if (llm_ && llm_->Healthy()) {
             try {
                 std::string prompt = PromptBuilder::ResponseCompositionStreamPrompt(
-                    user_request, slots_str, items_json);
+                    user_request, slots_str, items_json, grounding);
                 std::vector<LlmMessage> messages{
                     {"system", kSystem},
                     {"user", prompt}
@@ -206,7 +207,7 @@ coro::Task<RecommendationResult> ResponseComposer::Compose(
     if (llm_ && llm_->Healthy()) {
         try {
             std::string prompt = PromptBuilder::ResponseCompositionPrompt(
-                user_request, slots_str, items_json);
+                user_request, slots_str, items_json, grounding);
             std::vector<LlmMessage> messages{
                 {"system", kSystem},
                 {"user", prompt}

@@ -18,8 +18,10 @@ class FakeLlmClient : public LlmClient {
 public:
     coro::Task<LlmResponse> Chat(const std::vector<LlmMessage>& msgs,
                                  const Options& /*opts*/) override {
-        (void)msgs;
         ++call_count;
+        for (const auto& m : msgs) {
+            if (m.role == "user") last_user_message = m.content;
+        }
         LlmResponse r;
         r.raw_text = raw_text;
         co_return r;
@@ -27,6 +29,7 @@ public:
     bool Healthy() const override { return healthy; }
 
     std::string raw_text;
+    std::string last_user_message;
     int call_count = 0;
     bool healthy = true;
 };
@@ -39,10 +42,13 @@ public:
         ++chat_count;
         co_return LlmResponse{};
     }
-    coro::Task<LlmStreamResult> ChatStream(const std::vector<LlmMessage>&,
+    coro::Task<LlmStreamResult> ChatStream(const std::vector<LlmMessage>& msgs,
                                            const Options&,
                                            const DeltaCallback& on_delta) override {
         ++stream_count;
+        for (const auto& m : msgs) {
+            if (m.role == "user") last_user_message = m.content;
+        }
         for (const auto& s : chunks) {
             if (on_delta) on_delta(s);
         }
@@ -55,6 +61,7 @@ public:
 
     std::vector<std::string> chunks = {"我", "为您", "推荐"};
     std::string joined = "我为您推荐";
+    std::string last_user_message;
     int stream_count = 0;
     int chat_count = 0;
 };

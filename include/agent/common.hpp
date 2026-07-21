@@ -57,6 +57,10 @@ struct RecommendationResult {
     std::vector<RecommendationItem> items;
     bool is_clarifying = false;
     std::string next_state;
+    // Knowledge-base passages (kb_search) that grounded the reply, rendered as
+    // readable snippets ("【title】content（来源：source）"). Empty when no RAG
+    // retrieval ran, so non-RAG responses are unchanged.
+    std::vector<std::string> grounding;
 };
 
 struct ToolCall {

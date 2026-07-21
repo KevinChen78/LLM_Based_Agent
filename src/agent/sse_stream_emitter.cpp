@@ -48,6 +48,10 @@ void SseStreamEmitter::Finish(const RecommendationResult& result) {
         ji["tags"] = item.tags;
         j["items"].push_back(ji);
     }
+    // RAG grounding passages (only present when kb_search ran).
+    if (!result.grounding.empty()) {
+        j["grounding"] = result.grounding;
+    }
     PushEvent("final", j);
 
     {

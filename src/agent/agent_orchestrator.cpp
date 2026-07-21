@@ -38,6 +38,18 @@ void FinishIf(const std::shared_ptr<StreamEmitter>& emitter,
     }
 }
 
+// Render one knowledge passage as a compact readable snippet.
+std::string FormatPassage(const nlohmann::json& p) {
+    std::string title = p.value("title", "");
+    std::string content = p.value("content", "");
+    std::string source = p.value("source", "");
+    std::string s;
+    if (!title.empty()) s += "【" + title + "】";
+    s += content;
+    if (!source.empty()) s += "（来源：" + source + "）";
+    return s;
+}
+
 } // namespace
 
 AgentOrchestrator::AgentOrchestrator(
@@ -148,6 +160,9 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStream(
         };
 
         nlohmann::json accumulated_items = nlohmann::json::array();
+        // Knowledge passages returned by kb_search, collected separately from
+        // deal candidates. These ground the composed reply (RAG).
+        nlohmann::json grounding_passages = nlohmann::json::array();
         spdlog::info("Executing {} tool calls for action={}", plan.tool_calls.size(), plan.next_state);
         for (const auto& call : plan.tool_calls) {
             auto tool = tools_->Get(call.tool_name);
@@ -198,6 +213,10 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStream(
             }
             try {
                 auto j = nlohmann::json::parse(tool_result.result_json);
+                // kb_search returns {"passages":[...]} — collect as grounding.
+                if (j.contains("passages") && j["passages"].is_array()) {
+                    for (const auto& p : j["passages"]) grounding_passages.push_back(p);
+                }
                 if (!j.contains("items")) continue;
                 if (is_ranker(call.tool_name)) {
                     // A ranker refines the candidate set: its output replaces.
@@ -235,8 +254,23 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStream(
         }
 
         // 8. Compose response
+        // Build the grounding block (readable snippets + a numbered text block
+        // for the LLM prompt) from any kb_search passages.
+        std::string grounding_text;
+        for (const auto& p : grounding_passages) {
+            std::string snippet = FormatPassage(p);
+            if (snippet.empty()) continue;
+            result.grounding.push_back(snippet);
+            grounding_text += std::to_string(result.grounding.size()) + ". " + snippet + "\n";
+        }
+        if (!result.grounding.empty()) {
+            spdlog::info("Grounding reply with {} knowledge passage(s)", result.grounding.size());
+            EmitIf(emitter, "grounding", nlohmann::json{{"passage_count", result.grounding.size()}});
+        }
+
         EmitIf(emitter, "composing", nlohmann::json{{"detail", "generating reply"}});
-        auto composed = co_await composer_->Compose(req.user_message, plan.slots, items, emitter);
+        auto composed = co_await composer_->Compose(
+            req.user_message, plan.slots, items, emitter, grounding_text);
         result.response_text = composed.response_text;
         result.items = std::move(composed.items);
         result.is_clarifying = false;

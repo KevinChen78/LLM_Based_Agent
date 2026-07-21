@@ -17,7 +17,8 @@ public:
     static std::string ResponseCompositionPrompt(
         const std::string& user_request,
         const std::string& slots_json,
-        const std::string& items_json);
+        const std::string& items_json,
+        const std::string& grounding = "");
 
     // Streaming variant: asks the model to emit natural-language prose
     // directly (no JSON, no markdown fences) so tokens can be forwarded
@@ -25,7 +26,8 @@ public:
     static std::string ResponseCompositionStreamPrompt(
         const std::string& user_request,
         const std::string& slots_json,
-        const std::string& items_json);
+        const std::string& items_json,
+        const std::string& grounding = "");
 
     static std::string InputSafetyPrompt(const std::string& user_message);
 

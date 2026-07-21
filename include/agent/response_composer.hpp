@@ -26,11 +26,17 @@ public:
     // token as `delta` events via the LLM's ChatStream. If real streaming is
     // unavailable (offline / gateway down), emits the templated reply as a
     // sequence of deltas so the client still observes the streaming wire format.
+    //
+    // `grounding` is an optional block of knowledge-base passages (RAG) that is
+    // injected into the LLM prompt (both streaming and non-streaming) so the
+    // model answers factual questions from sourced text instead of guessing.
+    // It is ignored by the deterministic template fallback. Empty = no RAG.
     coro::Task<RecommendationResult> Compose(
         const std::string& user_request,
         const nlohmann::json& slots,
         const std::vector<RecommendationItem>& items,
-        std::shared_ptr<StreamEmitter> emitter = nullptr);
+        std::shared_ptr<StreamEmitter> emitter = nullptr,
+        const std::string& grounding = "");
 
 private:
     std::shared_ptr<LlmClient> llm_;
