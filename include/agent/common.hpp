@@ -42,8 +42,11 @@ struct RecommendationItem {
     double price = 0.0;
     double original_price = 0.0;
     std::string city;
+    std::string district;             // 区县/商圈，用于就近推荐
     std::vector<std::string> tags;
-    double score = 0.0;
+    double score = 0.0;               // 排序得分（归一化到 0~1）
+    long sold_count = 0;              // 销量，排序因子之一
+    double rating = 0.0;              // 评分（0~5），排序因子之一
     std::string reason;
 };
 

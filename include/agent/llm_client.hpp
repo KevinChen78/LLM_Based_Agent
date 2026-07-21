@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -48,6 +49,23 @@ public:
         const std::vector<LlmMessage>& messages,
         const Options& options) = 0;
 
+    // Streaming variant. `on_delta` is invoked for each incremental text chunk
+    // as the model emits it. The default implementation falls back to a single
+    // Chat() call with streamed=false (so clients without real streaming
+    // support inherit a sane, non-streaming behavior).
+    using DeltaCallback = std::function<void(const std::string&)>;
+
+    struct LlmStreamResult {
+        std::string text;                       // accumulated full text
+        bool streamed = false;                  // true only if real token streaming occurred
+        std::chrono::milliseconds latency{0};
+    };
+
+    virtual coro::Task<LlmStreamResult> ChatStream(
+        const std::vector<LlmMessage>& messages,
+        const Options& options,
+        const DeltaCallback& on_delta);
+
     virtual bool Healthy() const = 0;
 };
 
@@ -59,6 +77,13 @@ public:
     coro::Task<LlmResponse> Chat(
         const std::vector<LlmMessage>& messages,
         const Options& options) override;
+
+    // Real streaming via HTTP chunked SSE. When base_url is empty (offline
+    // stub), returns streamed=false immediately so callers can fall back.
+    coro::Task<LlmStreamResult> ChatStream(
+        const std::vector<LlmMessage>& messages,
+        const Options& options,
+        const DeltaCallback& on_delta) override;
 
     bool Healthy() const override;
 

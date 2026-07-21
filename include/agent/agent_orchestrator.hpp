@@ -1,6 +1,7 @@
 #pragma once
 
 #include "agent/common.hpp"
+#include "agent/stream_emitter.hpp"
 
 #include "coro/core/task.hpp"
 
@@ -33,7 +34,14 @@ public:
         std::shared_ptr<ResponseComposer> composer,
         std::shared_ptr<SafetyGuard> guard = nullptr);
 
+    // Non-streaming chat: returns the complete result.
     coro::Task<RecommendationResult> Chat(Request req);
+
+    // Streaming chat: emits pipeline events through `emitter` and finally
+    // returns the same result that the non-streaming path would produce.
+    // Passing emitter=nullptr degrades to the non-streaming behaviour.
+    coro::Task<RecommendationResult> ChatStream(
+        Request req, std::shared_ptr<StreamEmitter> emitter = nullptr);
 
 private:
     std::shared_ptr<TaskPlanner> planner_;

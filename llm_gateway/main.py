@@ -174,6 +174,48 @@ def call_real_llm(body):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def stream_real_llm(body, write):
+    """Forward a stream=true request to the upstream and pipe its SSE bytes
+    straight to `write` (a callable accepting bytes) as they arrive. The
+    upstream's `data: {...}\\n\\n` framing is preserved verbatim."""
+    forwarded = {
+        "model": LLM_MODEL,
+        "messages": body.get("messages", []),
+        "temperature": body.get("temperature", 0.3),
+        "stream": True,
+    }
+    if "max_tokens" in body:
+        forwarded["max_tokens"] = body["max_tokens"]
+
+    payload = json.dumps(forwarded, ensure_ascii=False).encode("utf-8")
+    url = LLM_API_BASE + "/chat/completions"
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {LLM_API_KEY}",
+            "Accept": "text/event-stream",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as resp:
+        while True:
+            chunk = resp.read(4096)
+            if not chunk:
+                break
+            write(chunk)
+
+
+def stub_stream(body, write_sse):
+    """Deterministic streaming fallback (no API key): emit the canned plan as a
+    single delta so the wire format is still exercised end to end."""
+    user_message = extract_user_input(body.get("messages", []))
+    content = json.dumps(make_plan(user_message), ensure_ascii=False)
+    write_sse({"choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]})
+    write_sse(None)  # [DONE] sentinel
+
+
 def generate_response(body):
     messages = body.get("messages", [])
 
@@ -222,6 +264,29 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    # --- SSE streaming helpers ---
+    def _begin_sse(self):
+        # HTTP/1.0 + Connection: close: the body is delimited by connection
+        # close (no Content-Length / chunked needed), which httplib on the
+        # client side reads incrementally via its content receiver.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def _write_sse_obj(self, obj):
+        # obj=None writes the terminating [DONE] sentinel.
+        if obj is None:
+            payload = b"data: [DONE]\n\n"
+        else:
+            payload = ("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8")
+        try:
+            self.wfile.write(payload)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def do_GET(self):
         if self.path == "/v1/health":
             self._send_json(200, {
@@ -243,7 +308,30 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self.send_error(400)
             return
+
+        if data.get("stream"):
+            self._begin_sse()
+            try:
+                if REAL_LLM_ENABLED:
+                    # Pipe upstream SSE bytes verbatim, then a terminating [DONE].
+                    stream_real_llm(data, lambda b: self._write_raw(b))
+                    self._write_sse_obj(None)
+                else:
+                    stub_stream(data, self._write_sse_obj)
+            except Exception as e:  # noqa: BLE001
+                print(f"[LLM Gateway] streaming failed: {e!r}")
+                self._write_sse_obj({"error": str(e)})
+                self._write_sse_obj(None)
+            return
+
         self._send_json(200, generate_response(data))
+
+    def _write_raw(self, data_bytes):
+        try:
+            self.wfile.write(data_bytes)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def log_message(self, fmt, *args):
         print(f"[LLM Gateway] {self.address_string()} - {fmt % args}")

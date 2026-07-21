@@ -37,7 +37,7 @@ TEST(TaskPlanner, EnoughSlotsTriggersRetrieve) {
 
     EXPECT_EQ(plan.next_state, "retrieve");
     EXPECT_FALSE(plan.tool_calls.empty());
-    EXPECT_EQ(plan.tool_calls[0].tool_name, "mock_retriever");
+    EXPECT_EQ(plan.tool_calls[0].tool_name, "deal_retriever");
 }
 
 int main(int argc, char** argv) {

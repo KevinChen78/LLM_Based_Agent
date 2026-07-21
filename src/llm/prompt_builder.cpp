@@ -25,9 +25,11 @@ std::string PromptBuilder::TaskPlanningPrompt(
 
 # 关键规则
 1. 如果 city、category、budget 中任意一项缺失或置信度低，必须进入追问（action = "clarify"）。
-2. 如果信息足够，action = "retrieve"，并生成 mock_retriever 工具调用。
-3. 不要编造用户没有提到的信息。
-4. 输出必须是合法 JSON，不要包含任何 Markdown 代码块标记。
+2. 如果信息足够，action = "retrieve"，并生成 deal_retriever 工具调用。
+3. 召回之后若用户有明确预算/人数/禁忌，可再追加一个 deal_ranker 工具调用做精排
+   （candidates 留空，系统会自动注入上一步召回结果）。
+4. 不要编造用户没有提到的信息。
+5. 输出必须是合法 JSON，不要包含任何 Markdown 代码块标记。
 
 # 输出格式
 {
@@ -47,9 +49,9 @@ std::string PromptBuilder::TaskPlanningPrompt(
 }
 
 # 当 action = retrieve 时
-tool_calls 必须包含：
+tool_calls 必须先包含召回调用：
 {
-  "tool_name": "mock_retriever",
+  "tool_name": "deal_retriever",
   "arguments": {
     "city": "上海",
     "category": "海鲜",
@@ -57,6 +59,17 @@ tool_calls 必须包含：
     "people": 3,
     "keywords": "",
     "top_k": 20
+  }
+}
+若有预算/人数/禁忌需要精排，可再追加（candidates 留空即可，系统会自动注入召回结果）：
+{
+  "tool_name": "deal_ranker",
+  "arguments": {
+    "candidates": [],
+    "budget": 300,
+    "people": 3,
+    "taboo": "",
+    "top_n": 3
   }
 }
 
@@ -81,10 +94,11 @@ std::string PromptBuilder::ResponseCompositionPrompt(
 
 # 规则
 1. 价格、折扣、商家名称必须与商品数据一致，禁止编造。
-2. 推荐理由要结合用户原始需求（人数、预算、偏好）。
-3. 回复语气亲切自然，适合聊天场景。
+2. 推荐理由要结合用户原始需求（人数、预算、偏好、禁忌）。
+3. 回复语气亲切自然，适合聊天场景；先给一句总览，再点名几个亮点商品。
 4. 如果推荐列表为空，说明原因并给出建议。
-5. 输出必须是合法 JSON，不要包含 Markdown 代码块标记。
+5. 输出必须是合法 JSON，不要包含任何 Markdown 代码块标记。
+6. item_reasons 的 key 必须是商品的 item_id，value 是该商品的一句话亮点理由。
 
 # 输出格式
 {
@@ -105,6 +119,31 @@ std::string PromptBuilder::ResponseCompositionPrompt(
 )" + items_json + R"(
 
 请直接输出 JSON：)";
+}
+
+std::string PromptBuilder::ResponseCompositionStreamPrompt(
+    const std::string& user_request,
+    const std::string& slots_json,
+    const std::string& items_json) {
+    return R"(# Role
+你是团购推荐助手。请根据已筛选并排序好的团购商品，直接输出一段自然、有吸引力、要点清晰的中文推荐回复。
+
+# 规则
+1. 直接输出自然语言文本，不要输出 JSON，不要使用 Markdown 代码块或代码围栏。
+2. 价格、折扣、商家名称必须与商品数据一致，禁止编造。
+3. 先给一句总览，再点名 2~3 个亮点商品，语气亲切自然，适合聊天场景。
+4. 结合用户需求（人数、预算、偏好、禁忌）。
+
+# 用户原始需求
+)" + user_request + R"(
+
+# 已填充槽位
+)" + slots_json + R"(
+
+# Top 推荐商品（已排序）
+)" + items_json + R"(
+
+请直接输出推荐回复：)";
 }
 
 std::string PromptBuilder::InputSafetyPrompt(const std::string& user_message) {

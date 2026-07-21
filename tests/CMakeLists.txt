@@ -2,6 +2,9 @@ add_executable(test_agent
     test_task_planner.cpp
     test_safety_guard.cpp
     test_sqlite_session.cpp
+    test_streaming.cpp
+    test_deals_tools.cpp
+    test_composer.cpp
 )
 
 target_link_libraries(test_agent PRIVATE

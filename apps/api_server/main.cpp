@@ -5,11 +5,13 @@
 #include "coro/coro.hpp"
 
 #include "agent/agent_orchestrator.hpp"
+#include "agent/deal_catalog.hpp"
+#include "agent/deal_tools.hpp"
 #include "agent/llm_client.hpp"
-#include "agent/mock_tools.hpp"
 #include "agent/response_composer.hpp"
 #include "agent/safety_guard.hpp"
 #include "agent/session_memory.hpp"
+#include "agent/sse_stream_emitter.hpp"
 #include "agent/sqlite_session_store.hpp"
 #include "agent/task_planner.hpp"
 #include "agent/tool_registry.hpp"
@@ -76,8 +78,12 @@ json ToJson(const RecommendationResult& r) {
         ji["item_id"] = item.item_id;
         ji["title"] = item.title;
         ji["category"] = item.category;
+        ji["city"] = item.city;
+        ji["district"] = item.district;
         ji["price"] = item.price;
         ji["original_price"] = item.original_price;
+        ji["sold_count"] = item.sold_count;
+        ji["rating"] = item.rating;
         ji["score"] = item.score;
         ji["reason"] = item.reason;
         ji["tags"] = item.tags;
@@ -101,8 +107,17 @@ int main() {
     auto llm = std::make_shared<HttpLlmClient>(llm_base_url, "");
     auto planner = std::make_shared<TaskPlanner>(llm);
     auto tools = std::make_shared<ToolRegistry>();
-    tools->Register(std::make_shared<MockRetriever>());
-    tools->Register(std::make_shared<MockRanker>());
+    // Retrieval / ranking: real catalog-backed backend (default and only wired
+    // backend). MockRetriever / MockRanker remain in the codebase as a Phase-0
+    // reference implementation but are not registered here.
+    //   DEALS_CATALOG_PATH — override the catalog JSON path (default data/deals.json).
+    const char* catalog_env = std::getenv("DEALS_CATALOG_PATH");
+    std::string catalog_path = catalog_env ? catalog_env : "data/deals.json";
+    auto catalog = std::make_shared<DealCatalog>(catalog_path);
+    tools->Register(std::make_shared<DealRetriever>(catalog));
+    tools->Register(std::make_shared<DealRanker>());
+    std::cout << "Retrieval backend: Catalog (" << catalog_path
+              << ", " << catalog->Size() << " deals)" << std::endl;
     // Session storage: SQLite (persistent) by default, InMemory fallback.
     //   SESSION_STORE=sqlite|memory   (default sqlite)
     //   SESSION_DB_PATH=data/sessions.db
@@ -147,6 +162,47 @@ int main() {
                 resp.json(ToJson(result).dump());
             } catch (const std::exception& e) {
                 spdlog::error("Error handling /v1/chat: {}", e.what());
+                resp.status(coro::net::http::Status::InternalServerError)
+                    .json(json{{"error", e.what()}}.dump());
+            }
+            co_return;
+        })
+        .post("/v1/chat/stream", [orchestrator](const Request& req, Response& resp) -> Task<void> {
+            try {
+                auto body = json::parse(req.body());
+                UserContext ctx;
+                ctx.user_id = body.value("user_id", "");
+                ctx.session_id = body.value("session_id", "");
+                ctx.city = body.value("city", "");
+                ctx.longitude = body.value("longitude", 0.0);
+                ctx.latitude = body.value("latitude", 0.0);
+                ctx.device_type = body.value("device_type", "");
+
+                AgentOrchestrator::Request areq{
+                    .user_context = ctx,
+                    .user_message = body.value("message", "")
+                };
+
+                auto emitter = std::make_shared<agent::SseStreamEmitter>();
+                resp.status(coro::net::http::Status::OK)
+                    .content_type("text/event-stream; charset=utf-8")
+                    .header("Cache-Control", "no-cache")
+                    .stream(emitter->Writer());
+
+                // Run the orchestrator in a detached thread so the handler can
+                // return immediately and the server starts streaming headers.
+                auto orch = orchestrator;
+                std::thread([orch, areq, emitter]() mutable {
+                    try {
+                        auto task = orch->ChatStream(areq, emitter);
+                        task.result();
+                    } catch (const std::exception& e) {
+                        spdlog::error("Streaming orchestrator thread error: {}", e.what());
+                        emitter->Error(std::string("orchestrator error: ") + e.what());
+                    }
+                }).detach();
+            } catch (const std::exception& e) {
+                spdlog::error("Error handling /v1/chat/stream: {}", e.what());
                 resp.status(coro::net::http::Status::InternalServerError)
                     .json(json{{"error", e.what()}}.dump());
             }
