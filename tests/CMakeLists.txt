@@ -5,6 +5,7 @@ add_executable(test_agent
     test_streaming.cpp
     test_deals_tools.cpp
     test_composer.cpp
+    test_kb.cpp
 )
 
 target_link_libraries(test_agent PRIVATE

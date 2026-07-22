@@ -41,8 +41,12 @@ void SseStreamEmitter::Finish(const RecommendationResult& result) {
         ji["item_id"] = item.item_id;
         ji["title"] = item.title;
         ji["category"] = item.category;
+        ji["city"] = item.city;
+        ji["district"] = item.district;
         ji["price"] = item.price;
         ji["original_price"] = item.original_price;
+        ji["sold_count"] = item.sold_count;
+        ji["rating"] = item.rating;
         ji["score"] = item.score;
         ji["reason"] = item.reason;
         ji["tags"] = item.tags;

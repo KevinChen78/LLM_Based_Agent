@@ -5,6 +5,7 @@
 ```text
 LLM_Based_Agent/
 ├── apps/api_server/     # HTTP 服务入口
+├── web/                 # Web 前端（Vanilla HTML/CSS/JS，api_server 托管）
 ├── include/agent/       # 公共头文件
 ├── src/                 # 核心实现
 │   ├── agent/           # 编排层
@@ -12,6 +13,7 @@ LLM_Based_Agent/
 │   ├── tools/           # Mock 工具
 │   └── memory/          # 会话记忆
 ├── llm_gateway/         # Python Mock LLM Gateway
+├── retrieval_service/   # Python BM25 检索服务（商品语义召回 + 知识库 RAG）
 ├── tests/               # 单元测试
 ├── proto/               # gRPC/Protobuf 定义
 ├── configs/             # 配置文件
@@ -111,6 +113,42 @@ python -u llm_gateway/main.py
 
 上游不可用时网关自动回退到确定性 stub，不会让整条链路失败。
 
+## Web 前端界面
+
+`api_server` 内置了一个**零依赖的 Web 聊天界面**（Vanilla HTML/CSS/JS，无构建、无 node_modules），
+与 API 同源托管，浏览器打开即用：
+
+```powershell
+# 照常起三进程（web/ 由 api_server 自动托管，可用 WEB_DIR 覆盖）
+python retrieval_service/main.py
+python llm_gateway/main.py
+$env:RETRIEVAL_SERVICE_URL="http://localhost:8001"
+.\build\bin\Release\api_server.exe
+# 启动日志显示 Web UI: web/ (served at /)
+```
+
+浏览器访问 **http://localhost:8080/** 即可。功能：
+
+- **对话优先**的聊天界面（类 ChatGPT/微信），用户/助手气泡、流式打字效果。
+- **逐 token 流式**：通过 `fetch + ReadableStream` 手动解析 `/v1/chat/stream` 的 SSE
+  （原生 `EventSource` 只支持 GET，本端点是 POST，故前端自行解析 `data: {...}\n\n` 帧）。
+- **思考过程**：可折叠面板实时展示 `商品召回 / 智能排序 / 知识检索` 各工具的调用与完成状态。
+- **商品卡片**：内嵌展示价格/原价/折扣、⭐评分、🔥销量、📍区县、tags、推荐理由。
+- **回答依据**：kb_search 命中时展示知识库 grounding 段落（折叠面板）。
+- **追问芯片**：clarify 时按 `missing_slots` 给出城市/人数/预算/类目快捷填充。
+- **示例问题**一键发送、会话持久（`session_id` 存 localStorage，复用后端 SQLite 记忆）、
+  在线状态点（轮询 `/v1/health`）、中途停止生成（AbortController）、
+  流式失败自动降级为 `/v1/chat` 一次性回复。
+
+实现要点：
+
+- 静态托管在 `apps/api_server/main.cpp`：`ServeStaticFile()` 读 `web/` 下文件按扩展名设 MIME，
+  含**路径穿越防护**（`..`、绝对路径 → 404）；coro 路由是精确键匹配，故每个资源一条 `.get()` 路由
+  （`/`、`/index.html`、`/styles.css`、`/app.js`）。`WEB_DIR` 环境变量可覆盖目录（默认 `web`）。
+- 前端三文件：[web/index.html](web/index.html)、[web/styles.css](web/styles.css)、[web/app.js](web/app.js)。
+- 流式 `final.items` 已补全 `city/district/sold_count/rating`（对齐 `/v1/chat` 的 12 字段），
+  卡片数据完整。
+
 ### 让 C++ 端用本地 stub（不连网关）
 
 ```powershell
@@ -122,7 +160,7 @@ $env:LLM_BASE_URL=""          # Windows
 
 - `HttpLlmClient`：`base_url` 非空时走 HTTP 调用 LLM Gateway（默认 `http://localhost:8000`）；为空则降级为内置确定性 Stub。默认超时 45s（适配推理模型）。
 - `llm_gateway`：未配置 `LLM_API_KEY` 时为确定性 stub；配置后透传到真实 OpenAI-compatible LLM，并对后端模型名做权威覆盖。
-- 召回/排序默认使用**真实目录后端**（`DealRetriever` + `DealRanker`，读 `data/deals.json`，缺失时用内置兜底数据集）；可用 `RETRIEVAL_BACKEND=mock` 切回内存 Mock 实现。
+- 召回/排序默认使用**真实目录后端**（`DealRetriever` + `DealRanker`，读 `data/deals.json`，缺失时用内置兜底数据集）；设 `RETRIEVAL_SERVICE_URL` 后文本相关性升级为检索服务的 BM25（见下文 RAG 章节）。
 - 会话记忆默认为 **SQLite** 持久化实现（`SqliteSessionStore`），支持跨进程重启保持会话；可用 `SESSION_STORE=memory` 切回内存实现。
 - gRPC/Protobuf 仅保留定义文件，Phase 0 先通过 HTTP JSON 通信。
 
@@ -250,6 +288,7 @@ data: {"event":"final","data":{"session_id":"...","reply":"...","items":[...]}}
 | `plan` | 规划完成，携带 `next_state`、`missing_slots`、`tool_count` |
 | `tool_call` | 开始调用工具（`chained` 表示编排器是否自动注入了上一步结果）|
 | `tool_result` | 工具调用结束 |
+| `grounding` | 知识库命中（`passage_count`），仅 kb_search 有结果时出现 |
 | `composing` | 正在生成回复 |
 | `delta` | **token 级增量**，`data.content` 为一段文本片段，拼起来即完整回复 |
 | `final` | 完整 `RecommendationResult`（与 `/v1/chat` 返回一致）|
@@ -272,6 +311,69 @@ data: {"event":"final","data":{"session_id":"...","reply":"...","items":[...]}}
 | 进度可见 | 无 | 有（planning / tool / composing 等）|
 | 连接 | 请求-响应 | 长连接，流结束后关闭 |
 | 适用场景 | 简单集成 | 需要实时反馈 / 后续 token 流 |
+
+## RAG：BM25 商品语义召回 + 知识库问答
+
+在真实目录后端之上，可选地接入一个**纯 Python 标准库**的检索服务
+（[retrieval_service/main.py](retrieval_service/main.py)，:8001），提供两层 RAG 能力：
+
+1. **商品语义召回**：`DealRetriever` 的文本相关性从子串匹配升级为 **BM25**
+   （中文按字符 bigram 分词，无需 jieba；英文按单词；k1=1.5，b=0.75），
+   同义词/口语表达召回率更高。结构化过滤（城市/类目/价格/人数）规则与 C++ 端一致，
+   先过滤再对存活集做 BM25；query 为空或无文本命中时回退到评分排序。
+2. **知识库 RAG**：新增工具 `kb_search`（`KnowledgeRetriever`），检索
+   [data/knowledge.json](data/knowledge.json)（22 条 FAQ/政策/菜品知识：
+   发票/预约/退款/包间/停车/忌口/营业时间/核销等）。编排器把命中的段落收集为
+   **grounding**，注入 composer 的 LLM prompt（`# 参考知识` 块），让事实性回答
+   有据可依而非编造；`/v1/chat` 响应与流式 `final` 事件都会带上 `grounding` 字段。
+
+### 启用方式
+
+```powershell
+# 1. 启动检索服务（:8001）
+python retrieval_service/main.py
+
+# 2. 启动网关（:8000）与 api_server（:8080），并指向检索服务
+python llm_gateway/main.py
+$env:RETRIEVAL_SERVICE_URL="http://localhost:8001"
+.\build\bin\Release\api_server.exe
+# 启动日志：Retrieval service: http://localhost:8001 (BM25 deals + kb_search)
+```
+
+`RETRIEVAL_SERVICE_URL` 为空（默认）= **完全离线降级**：商品检索退回本地子串匹配、
+不注册 `kb_search`、无 grounding，原有行为不变。服务中途宕机时单次调用自动回退本地逻辑。
+
+### 服务契约
+
+```text
+GET  /v1/health          -> {"status":"ok","deal_count":120,"kb_count":22}
+POST /v1/retrieve/deals  body {"query","city","category","district","max_price","min_price","people","top_k"}
+                     -> {"items":[<完整 deal>+score], "total":N}
+POST /v1/retrieve/kb     body {"query","top_k"}
+                     -> {"passages":[{"id","category","title","content","source","score"}]}
+```
+
+C++ 侧由 `RetrievalClient`（[include/agent/retrieval_client.hpp](include/agent/retrieval_client.hpp)，
+cpp-httplib，非流式 POST）封装；`DealRetriever` 注入 client 后健康则委托 BM25，
+`KnowledgeRetriever` 只在 `RETRIEVAL_SERVICE_URL` 非空时注册。
+
+### 实测（DeepSeek deepseek-v4-flash + 检索服务）
+
+问「武汉3人想吃小龙虾，预算400，请问能开发票吗？有没有包间？」：
+规划器同时发出 `deal_retriever`(BM25) + `deal_ranker` + `kb_search` 三个调用，
+回复既推荐商品又依据知识段落回答「所有套餐都支持开具发票…包间预订时请在备注中说明」，
+`grounding` 字段携带发票与包间两条知识片段。流式端点事件序列为
+`tool_call(deal_retriever/deal_ranker/kb_search) → grounding → delta×196 → final(含 grounding)`。
+
+### 升级路径
+
+BM25 → embedding 时只需在 `retrieval_service` 内把 `BM25Index` 换成
+sentence-transformers（如 `paraphrase-multilingual-MiniLM-L12-v2`）+ 余弦检索，
+端点契约不变，C++ 侧零改动。
+
+单测见 [tests/test_kb.cpp](tests/test_kb.cpp)（kb_search 契约/未配置/服务宕机、
+BM25 委托/回退/无 client 不回归）与 [tests/test_composer.cpp](tests/test_composer.cpp)
+（grounding 注入 prompt、空 items + 有 grounding 仍走 LLM 回答知识问题）。
 
 ## 相关文件
 

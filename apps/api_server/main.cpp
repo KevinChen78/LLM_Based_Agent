@@ -20,8 +20,11 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -53,6 +56,44 @@ BOOL WINAPI ConsoleHandler(DWORD signal) {
     return TRUE;
 }
 #endif
+
+// MIME type by file extension for the static-file handler.
+std::string MimeFor(const std::string& path) {
+    auto dot = path.rfind('.');
+    if (dot == std::string::npos) return "application/octet-stream";
+    std::string ext = path.substr(dot);
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (ext == ".html" || ext == ".htm") return "text/html; charset=utf-8";
+    if (ext == ".css") return "text/css; charset=utf-8";
+    if (ext == ".js") return "application/javascript; charset=utf-8";
+    if (ext == ".json") return "application/json; charset=utf-8";
+    if (ext == ".svg") return "image/svg+xml";
+    if (ext == ".png") return "image/png";
+    if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
+    if (ext == ".ico") return "image/x-icon";
+    if (ext == ".woff2") return "font/woff2";
+    return "application/octet-stream";
+}
+
+// Serve a single file from the web directory. Guards against path traversal
+// (".." or absolute paths) and falls back to 404. The coro router matches
+// exact keys, so each served asset has its own .get() route (see main()).
+void ServeStaticFile(Response& resp, const std::string& web_dir, const std::string& rel) {
+    if (rel.empty() || rel.find("..") != std::string::npos ||
+        rel.front() == '/' || rel.front() == '\\') {
+        resp.status(coro::net::http::Status::NotFound).text("Not Found");
+        return;
+    }
+    std::ifstream f(web_dir + "/" + rel, std::ios::binary);
+    if (!f) {
+        resp.status(coro::net::http::Status::NotFound).text("Not Found");
+        return;
+    }
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)),
+                                std::istreambuf_iterator<char>());
+    resp.content_type(MimeFor(rel)).body(bytes);
+}
 
 } // namespace
 
@@ -159,6 +200,13 @@ int main() {
     auto orchestrator = std::make_shared<AgentOrchestrator>(
         planner, tools, memory, llm, composer, guard);
 
+    // Web UI static assets. Served from WEB_DIR (default "web", relative to
+    // cwd) on the same origin as the API, so no CORS is needed. The coro
+    // router matches exact keys, so each file has its own GET route.
+    const char* web_env = std::getenv("WEB_DIR");
+    std::string web_dir = web_env ? web_env : "web";
+    std::cout << "Web UI: " << web_dir << "/ (served at /)" << std::endl;
+
     ThreadPool pool(4);
     Server server(pool, 8080);
 
@@ -235,6 +283,23 @@ int main() {
         })
         .get("/v1/health", [](const Request& req, Response& resp) -> Task<void> {
             resp.json(json{{"status", "ok"}}.dump());
+            co_return;
+        })
+        // Static web UI (flat web/ dir; each asset gets an exact GET route).
+        .get("/", [&web_dir](const Request&, Response& r) -> Task<void> {
+            ServeStaticFile(r, web_dir, "index.html");
+            co_return;
+        })
+        .get("/index.html", [&web_dir](const Request&, Response& r) -> Task<void> {
+            ServeStaticFile(r, web_dir, "index.html");
+            co_return;
+        })
+        .get("/styles.css", [&web_dir](const Request&, Response& r) -> Task<void> {
+            ServeStaticFile(r, web_dir, "styles.css");
+            co_return;
+        })
+        .get("/app.js", [&web_dir](const Request&, Response& r) -> Task<void> {
+            ServeStaticFile(r, web_dir, "app.js");
             co_return;
         });
 

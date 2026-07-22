@@ -1,4 +1,5 @@
 #include "agent/response_composer.hpp"
+#include "agent/json_extract.hpp"
 #include "agent/llm_client.hpp"
 #include "agent/prompt_builder.hpp"
 
@@ -98,50 +99,13 @@ std::optional<std::string> ApplyComposition(const nlohmann::json& j,
     return reply;
 }
 
-// Parse the model output into a reply. Tolerates three forms the model may emit:
-//   1. clean JSON,
-//   2. JSON wrapped in a ```json ... ``` markdown fence,
-//   3. JSON embedded in prose (extract first '{' .. last '}').
+// Parse the model output into a reply. Uses the shared tolerant extractor
+// (clean JSON / markdown fence / embedded-in-prose) then merges item_reasons.
 std::optional<std::string> TryParseComposition(const std::string& raw,
                                                std::vector<RecommendationItem>& items) {
-    // 1. Direct parse.
-    try {
-        if (auto r = ApplyComposition(nlohmann::json::parse(raw), items)) return r;
-    } catch (const std::exception&) {}
-
-    // 2. Strip a markdown code fence and retry.
-    auto fence = raw.find("```");
-    if (fence != std::string::npos) {
-        std::string t = raw.substr(fence + 3);
-        if (t.rfind("json", 0) == 0) t.erase(0, 4);
-        auto close = t.rfind("```");
-        if (close != std::string::npos) {
-            t.erase(close);
-            while (!t.empty() && (t.front() == '\n' || t.front() == '\r' || t.front() == ' ')) {
-                t.erase(0, 1);
-            }
-            while (!t.empty() && (t.back() == '\n' || t.back() == '\r' || t.back() == ' ')) {
-                t.pop_back();
-            }
-            try {
-                if (auto r = ApplyComposition(nlohmann::json::parse(t), items)) return r;
-            } catch (const std::exception&) {}
-        }
-    }
-
-    // 3. First '{' .. last '}'.
-    auto fb = raw.find('{');
-    auto fe = raw.rfind('}');
-    if (fb != std::string::npos && fe != std::string::npos && fe > fb) {
-        try {
-            if (auto r = ApplyComposition(
-                    nlohmann::json::parse(raw.substr(fb, fe - fb + 1)), items)) {
-                return r;
-            }
-        } catch (const std::exception&) {}
-    }
-
-    return std::nullopt;
+    auto j = ExtractJsonObject(raw);
+    if (!j) return std::nullopt;
+    return ApplyComposition(*j, items);
 }
 
 } // namespace
@@ -158,8 +122,11 @@ coro::Task<RecommendationResult> ResponseComposer::Compose(
     RecommendationResult result;
     result.items = items;   // copy; LLM may enrich per-item reasons in place
 
-    // No candidates -> nothing for the LLM to write about; short-circuit.
-    if (items.empty()) {
+    // No candidates AND no grounding -> nothing for the LLM to write about;
+    // short-circuit. When grounding passages exist (kb_search answered a
+    // factual question), fall through so the LLM can answer from the knowledge
+    // even though there are no deals to recommend.
+    if (items.empty() && grounding.empty()) {
         result.response_text = "抱歉，暂时没有符合条件的团购。您可以换个城市或预算试试。";
         if (emitter) StreamText(*emitter, result.response_text);
         co_return result;
@@ -184,6 +151,9 @@ coro::Task<RecommendationResult> ResponseComposer::Compose(
                 auto options = LlmClient::Options{};
                 options.temperature = 0.6;
                 options.timeout = kComposeTimeout;
+                // Reasoning models burn tokens on reasoning before prose; give
+                // the reply ample room (the 1024 default truncated outputs).
+                options.max_tokens = 2048;
                 auto sr = co_await llm_->ChatStream(
                     messages, options,
                     [&emitter](const std::string& d) { emitter->EmitDelta(d); });
@@ -215,6 +185,7 @@ coro::Task<RecommendationResult> ResponseComposer::Compose(
             auto options = LlmClient::Options{};
             options.temperature = 0.6;
             options.timeout = kComposeTimeout;
+            options.max_tokens = 2048;   // see streaming path note
             auto resp = co_await llm_->Chat(messages, options);
 
             auto reply = TryParseComposition(resp.raw_text, result.items);

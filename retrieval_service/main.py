@@ -223,20 +223,22 @@ def retrieve_deals(body):
     top_k = int(body.get("top_k", 20))
     candidates = filter_deals(DEAL_CORPUS.docs, body)
 
+    ranked = []
     if query_str.strip():
         qtok = tokenize(query_str)
         cand_ids = [i for i, _ in candidates]
         ranked = DEAL_CORPUS.index.search(qtok, candidate_ids=cand_ids, top_k=top_k)
-        if not ranked:
-            # No text match among survivors -> fall back to popularity order.
-            ranked = []
+
+    if ranked:
         items = []
         for doc_idx, score in ranked:
             d = dict(DEAL_CORPUS.docs[doc_idx])
             d["score"] = score
             items.append(d)
     else:
-        # No query: rank by rating desc (mirrors C++ no-keyword behaviour).
+        # Empty query OR no text match among the filtered survivors: fall back
+        # to rating order (mirrors the C++ no-keyword behaviour) so an odd
+        # keyword that matches nothing still yields the best filtered deals.
         ordered = sorted(candidates, key=lambda id_: id_[1].get("rating", 0), reverse=True)
         items = []
         for i, d in ordered[:top_k]:

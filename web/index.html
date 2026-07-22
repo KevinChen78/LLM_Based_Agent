@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>团购推荐助手</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🛒%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="app">
+    <header class="app-header">
+      <div class="brand">
+        <span class="brand-logo">🛒</span>
+        <span class="brand-name">团购推荐助手</span>
+      </div>
+      <div class="status" id="status" title="后端服务状态">
+        <span class="status-dot" id="status-dot"></span>
+        <span class="status-text" id="status-text">连接中…</span>
+      </div>
+    </header>
+
+    <main class="messages" id="messages" aria-live="polite">
+      <!-- 空态欢迎卡片（JS 渲染） -->
+    </main>
+
+    <footer class="composer">
+      <div class="composer-inner">
+        <textarea
+          id="input"
+          class="composer-input"
+          rows="1"
+          placeholder="描述你的需求，如：武汉3人想吃小龙虾，预算400"
+          aria-label="消息输入框"></textarea>
+        <button id="send" class="composer-send" aria-label="发送">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true">
+            <path d="M3 20.5v-6.8L15 12 3 10.3V3.5l18 8.5-18 8.5z"/>
+          </svg>
+        </button>
+        <button id="stop" class="composer-stop" hidden aria-label="停止生成">■</button>
+      </div>
+      <div class="composer-hint">Enter 发送 · Shift+Enter 换行</div>
+    </footer>
+  </div>
+</body>
+</html>

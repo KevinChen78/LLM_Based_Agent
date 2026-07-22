@@ -242,3 +242,67 @@ TEST(ResponseComposer, EmptyItemsEmitsDeltaAndShortCircuits) {
     EXPECT_GE(emitter->delta_count(), 1);
     EXPECT_NE(emitter->deltas().find("暂时没有"), std::string::npos);
 }
+
+// ---------------------------------------------------------------------------
+// Grounding (RAG knowledge passages)
+// ---------------------------------------------------------------------------
+
+TEST(ResponseComposer, GroundingIsInjectedIntoPrompt) {
+    auto llm = std::make_shared<FakeLlmClient>();
+    llm->raw_text = R"({"reply":"可以开发票的。"})";
+    ResponseComposer composer(llm);
+
+    std::string grounding = "1. 【发票】所有团购均可开具电子发票，下单后联系商家。（来源：商家政策）\n";
+    std::vector<RecommendationItem> items{MakeItem("gb-1", "蒜蓉小龙虾（3 人餐）", 268.0)};
+    auto result = composer.Compose("能开发票吗", json::object(), items,
+                                   nullptr, grounding).result();
+
+    EXPECT_EQ(llm->call_count, 1);
+    EXPECT_NE(llm->last_user_message.find("# 参考知识"), std::string::npos);
+    EXPECT_NE(llm->last_user_message.find("开具电子发票"), std::string::npos);
+    EXPECT_EQ(result.response_text, "可以开发票的。");
+}
+
+TEST(ResponseComposer, EmptyGroundingLeavesPromptUnchanged) {
+    auto llm = std::make_shared<FakeLlmClient>();
+    llm->raw_text = R"({"reply":"推荐如下。"})";
+    ResponseComposer composer(llm);
+
+    std::vector<RecommendationItem> items{MakeItem("gb-1", "蒜蓉小龙虾（3 人餐）", 268.0)};
+    composer.Compose("武汉吃小龙虾", json::object(), items, nullptr, "").result();
+
+    EXPECT_EQ(llm->call_count, 1);
+    // The "# 参考知识" section header appears only when grounding is injected
+    // (the rules alone merely mention the phrase in passing).
+    EXPECT_EQ(llm->last_user_message.find("# 参考知识"), std::string::npos);
+}
+
+TEST(ResponseComposer, StreamingGroundingIsInjectedIntoPrompt) {
+    auto llm = std::make_shared<FakeStreamingLlm>();
+    ResponseComposer composer(llm);
+    auto emitter = std::make_shared<RecordingEmitter>();
+
+    std::string grounding = "1. 【包间】本店提供包间，需提前预约。（来源：门店信息）\n";
+    std::vector<RecommendationItem> items{MakeItem("gb-1", "蒜蓉小龙虾（3 人餐）", 268.0)};
+    composer.Compose("有包间吗", json::object(), items, emitter, grounding).result();
+
+    EXPECT_EQ(llm->stream_count, 1);
+    EXPECT_NE(llm->last_user_message.find("# 参考知识"), std::string::npos);
+    EXPECT_NE(llm->last_user_message.find("提前预约"), std::string::npos);
+}
+
+TEST(ResponseComposer, EmptyItemsWithGroundingStillQueriesLlm) {
+    // Pure knowledge Q&A (no deals matched): the composer must NOT short-circuit
+    // to the "no deals" template when grounding passages are available — the
+    // LLM answers from the knowledge instead.
+    auto llm = std::make_shared<FakeLlmClient>();
+    llm->raw_text = R"({"reply":"可以开发票，下单后联系商家即可。"})";
+    ResponseComposer composer(llm);
+
+    std::string grounding = "1. 【发票】所有团购均可开具电子发票。（来源：商家政策）\n";
+    auto result = composer.Compose("能开发票吗", json::object(), {},
+                                   nullptr, grounding).result();
+
+    EXPECT_EQ(llm->call_count, 1);
+    EXPECT_EQ(result.response_text, "可以开发票，下单后联系商家即可。");
+}
