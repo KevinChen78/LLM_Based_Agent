@@ -51,11 +51,14 @@ coro::Task<LlmClient::LlmStreamResult> LlmClient::ChatStream(
 }
 
 // Parse one SSE event block (text between blank-line separators) and forward
-// any `delta.content` to the callback / accumulator.
+// any `delta.content` to the callback / accumulator. A trailing usage chunk
+// (stream_options.include_usage: empty choices + usage object) fills the
+// token out-params; absent usage leaves them at 0 (honest zero).
 namespace {
 void HandleSseEvent(const std::string& evt,
                     const LlmClient::DeltaCallback& on_delta,
-                    std::string& accumulated) {
+                    std::string& accumulated,
+                    int& prompt_tokens, int& completion_tokens) {
     std::istringstream iss(evt);
     std::string line;
     while (std::getline(iss, line)) {
@@ -69,6 +72,10 @@ void HandleSseEvent(const std::string& evt,
         if (payload.empty() || payload == "[DONE]") continue;
         try {
             auto j = nlohmann::json::parse(payload);
+            if (j.contains("usage") && j["usage"].is_object()) {
+                prompt_tokens = j["usage"].value("prompt_tokens", 0);
+                completion_tokens = j["usage"].value("completion_tokens", 0);
+            }
             if (j.contains("choices") && !j["choices"].empty()) {
                 auto& choice = j["choices"][0];
                 if (choice.contains("delta") && choice["delta"].contains("content")) {
@@ -150,7 +157,8 @@ bool SendAll(ag_sock_t sock, const std::string& data) {
 // error or non-200 status.
 bool ReadSseStream(ag_sock_t sock,
                    const LlmClient::DeltaCallback& on_delta,
-                   std::string& accumulated) {
+                   std::string& accumulated,
+                   int& prompt_tokens, int& completion_tokens) {
     std::string raw;
     std::string sse_buf;
     bool headers_done = false;
@@ -176,10 +184,11 @@ bool ReadSseStream(ag_sock_t sock,
         while ((pos = sse_buf.find("\n\n")) != std::string::npos) {
             std::string evt = sse_buf.substr(0, pos);
             sse_buf.erase(0, pos + 2);
-            HandleSseEvent(evt, on_delta, accumulated);
+            HandleSseEvent(evt, on_delta, accumulated, prompt_tokens, completion_tokens);
         }
     }
-    if (!sse_buf.empty()) HandleSseEvent(sse_buf, on_delta, accumulated);
+    if (!sse_buf.empty()) HandleSseEvent(sse_buf, on_delta, accumulated,
+                                         prompt_tokens, completion_tokens);
     return true;
 }
 
@@ -188,7 +197,8 @@ bool ReadSseStream(ag_sock_t sock,
 bool StreamHttpSse(const HttpUrl& url, const std::string& request,
                    long recv_timeout_ms,
                    const LlmClient::DeltaCallback& on_delta,
-                   std::string& accumulated) {
+                   std::string& accumulated,
+                   int& prompt_tokens, int& completion_tokens) {
 #ifdef _WIN32
     EnsureWinsock();
 #endif
@@ -220,7 +230,8 @@ bool StreamHttpSse(const HttpUrl& url, const std::string& request,
 
         if (::connect(sock, p->ai_addr, static_cast<int>(p->ai_addrlen)) == 0) {
             if (SendAll(sock, request)) {
-                ok = ReadSseStream(sock, on_delta, accumulated);
+                ok = ReadSseStream(sock, on_delta, accumulated,
+                                   prompt_tokens, completion_tokens);
             }
         }
         AG_SOCK_CLOSE(sock);
@@ -271,9 +282,11 @@ coro::Task<LlmClient::LlmStreamResult> HttpLlmClient::ChatStream(
     reqss << "Content-Length: " << body.size() << "\r\n\r\n" << body;
 
     std::string accumulated;
+    int prompt_tokens = 0, completion_tokens = 0;
     bool ok = StreamHttpSse(url, reqss.str(),
                             120000,   // recv timeout (ms); a stream may be long
-                            on_delta, accumulated);
+                            on_delta, accumulated,
+                            prompt_tokens, completion_tokens);
     if (!ok) {
         spdlog::warn("LLM stream request failed (host={}:{})", url.host, url.port);
         healthy_ = false;
@@ -283,6 +296,8 @@ coro::Task<LlmClient::LlmStreamResult> HttpLlmClient::ChatStream(
     healthy_ = true;
     out.text = std::move(accumulated);
     out.streamed = true;
+    out.prompt_tokens = prompt_tokens;
+    out.completion_tokens = completion_tokens;
     out.latency = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start);
     co_return out;

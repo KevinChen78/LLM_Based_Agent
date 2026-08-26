@@ -78,10 +78,53 @@ def main():
     fallback = sum(r["c"] for r in rows if r["a"] in ("FALLBACK", "ERROR"))
     print(f"  FALLBACK/ERROR 率: {pct(fallback, total)}")
 
-    r = q("SELECT COUNT(*) t, SUM(CASE WHEN item_count=0 AND grounding_count=0 "
-          "THEN 1 ELSE 0 END) e "
-          "FROM recommendation_logs WHERE action='retrieve'")[0]
-    print(f"  空推荐率 (retrieve 且无商品无知识): {pct(r['e'] or 0, r['t'])}")
+    # ---- 流量口径拆分(Phase 2.3-B1)----
+    # 三档口径:sim 模拟数据(user_id 以 sim- 开头,simulate_feedback.py 写入)
+    # / 测试流量(e2e 的 user_id='e2e',或 plan 调用模型为占位 stub 名
+    # 'gpt-4o-mini'——网关 stub 与 C++ 内置 stub 都落这个名)/ 真实流量(其余)。
+    stub_traces = {r["t"] for r in q(
+        "SELECT DISTINCT trace_id t FROM llm_calls WHERE model='gpt-4o-mini'")}
+
+    def cohort_of(row):
+        uid = row["user_id"] or ""
+        if uid.startswith("sim-"):
+            return "sim"
+        if uid == "e2e" or row["trace_id"] in stub_traces:
+            return "test"
+        return "real"
+
+    COHORT_LABEL = {"real": "真实", "test": "测试/stub", "sim": "模拟(sim-)"}
+    rec_rows = q("SELECT trace_id, user_id, action, item_count, grounding_count,"
+                 " request_text, slots_json FROM recommendation_logs")
+    cohorts = {"real": [0, 0], "test": [0, 0], "sim": [0, 0]}   # [retrieve_total, empty]
+    gaps = []
+    for row in rec_rows:
+        if row["action"] != "retrieve":
+            continue
+        c = cohort_of(row)
+        cohorts[c][0] += 1
+        if (row["item_count"] or 0) == 0 and (row["grounding_count"] or 0) == 0:
+            cohorts[c][1] += 1
+            if c == "real":
+                gaps.append(row)
+    print("\n■ 空推荐率(按流量口径拆分)")
+    for c in ("real", "test", "sim"):
+        t, e = cohorts[c]
+        if t:
+            print(f"  {COHORT_LABEL[c]:<10} {pct(e, t)}  ({e}/{t})")
+    if not any(t for t, _ in cohorts.values()):
+        print("  (无 retrieve 请求)")
+    if gaps and cohorts["real"][0] and cohorts["real"][1] / cohorts["real"][0] > 0.2:
+        # 真实流量空推荐率 >20%:暴露召回缺口清单(本阶段只暴露,不修召回)
+        import json as _json2
+        print("  ⚠ 真实流量空推荐率 >20%,召回缺口清单:")
+        for row in gaps[:10]:
+            try:
+                slots = _json2.loads(row["slots_json"] or "{}")
+            except ValueError:
+                slots = {}
+            print(f"    [{slots.get('city','?')}/{slots.get('category','?')}] "
+                  f"{(row['request_text'] or '')[:40]}")
 
     grounded = q("SELECT COUNT(*) c FROM recommendation_logs WHERE grounding_count>0")[0]["c"]
     print(f"  知识 grounding 触发: {grounded} 次 ({pct(grounded, total)})")

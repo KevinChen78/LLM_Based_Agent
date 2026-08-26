@@ -194,6 +194,10 @@ def stream_real_llm(body, write):
         "messages": body.get("messages", []),
         "temperature": body.get("temperature", 0.3),
         "stream": True,
+        # Ask the upstream for a trailing usage chunk (OpenAI-compatible;
+        # DeepSeek supports it). If the upstream ignores it, no usage chunk
+        # arrives and the C++ side honestly records tokens=0.
+        "stream_options": {"include_usage": True},
     }
     if "max_tokens" in body:
         forwarded["max_tokens"] = body["max_tokens"]
@@ -220,10 +224,18 @@ def stream_real_llm(body, write):
 
 def stub_stream(body, write_sse):
     """Deterministic streaming fallback (no API key): emit the canned plan as a
-    single delta so the wire format is still exercised end to end."""
+    single delta so the wire format is still exercised end to end. A trailing
+    usage chunk (char-count estimate, same convention as the non-streaming
+    stub) lets the observability trail record non-zero tokens offline."""
     user_message = extract_user_input(body.get("messages", []))
     content = json.dumps(make_plan(user_message), ensure_ascii=False)
     write_sse({"choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]})
+    # OpenAI convention: final usage chunk carries an empty choices array.
+    write_sse({"choices": [], "usage": {
+        "prompt_tokens": len(user_message),
+        "completion_tokens": len(content),
+        "total_tokens": len(user_message) + len(content),
+    }})
     write_sse(None)  # [DONE] sentinel
 
 

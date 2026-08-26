@@ -60,6 +60,11 @@ public:
         std::string text;                       // accumulated full text
         bool streamed = false;                  // true only if real token streaming occurred
         std::chrono::milliseconds latency{0};
+        // Token usage from the trailing `usage` SSE chunk (gateway requests
+        // stream_options.include_usage; stub emits an estimate). 0 when the
+        // upstream did not send usage — recorded honestly.
+        int prompt_tokens = 0;
+        int completion_tokens = 0;
     };
 
     virtual coro::Task<LlmStreamResult> ChatStream(

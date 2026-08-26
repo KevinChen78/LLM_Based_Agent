@@ -158,12 +158,15 @@ coro::Task<RecommendationResult> ResponseComposer::Compose(
                 auto sr = co_await llm_->ChatStream(
                     messages, options,
                     [&emitter](const std::string& d) { emitter->EmitDelta(d); });
-                // Streaming carries latency but no token usage (upstream does
-                // not send it); tokens stay 0 — recorded honestly.
+                // Token usage arrives in the trailing SSE usage chunk when the
+                // gateway gets it from the upstream (or the stub's estimate);
+                // it stays 0 when the upstream sends none — recorded honestly.
                 LlmCallInfo info;
                 info.purpose = "compose";
                 info.model = options.model;
                 info.latency = sr.latency;
+                info.prompt_tokens = sr.prompt_tokens;
+                info.completion_tokens = sr.completion_tokens;
                 if (sr.streamed && !sr.text.empty()) {
                     info.status = "success";
                     result.llm_calls.push_back(std::move(info));
