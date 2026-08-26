@@ -167,6 +167,7 @@ coro::Task<RecommendationResult> ResponseComposer::Compose(
                 info.latency = sr.latency;
                 info.prompt_tokens = sr.prompt_tokens;
                 info.completion_tokens = sr.completion_tokens;
+                info.raw_request = prompt;
                 if (sr.streamed && !sr.text.empty()) {
                     info.status = "success";
                     result.llm_calls.push_back(std::move(info));
@@ -210,6 +211,7 @@ coro::Task<RecommendationResult> ResponseComposer::Compose(
             info.prompt_tokens = resp.prompt_tokens;
             info.completion_tokens = resp.completion_tokens;
             info.latency = resp.latency;
+            info.raw_request = prompt;
             auto reply = TryParseComposition(resp.raw_text, result.items);
             if (reply && !reply->empty()) {
                 info.status = "success";

@@ -49,6 +49,7 @@ public:
         int completion_tokens = 0;
         int attempt = 0;
         long latency_ms = 0;
+        std::string raw_request;       // user-turn prompt (Phase 2.3-D audit)
     };
 
     // Opens (or creates) the database file and initialises the schema.

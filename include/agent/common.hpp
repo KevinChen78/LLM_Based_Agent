@@ -52,8 +52,10 @@ struct RecommendationItem {
 };
 
 // Metadata for one LLM call, returned by planner/composer so the orchestrator
-// can persist an audit row (llm_calls) keyed by trace_id. Streaming calls have
-// no token usage (upstream does not send it) — tokens stay 0, which is honest.
+// can persist an audit row (llm_calls) keyed by trace_id. Streaming compose
+// calls fill tokens from the trailing SSE usage chunk when the upstream sends
+// one (the gateway requests stream_options.include_usage); otherwise tokens
+// stay 0, which is honest.
 struct LlmCallInfo {
     std::string purpose;          // plan / compose
     std::string model;
@@ -62,6 +64,9 @@ struct LlmCallInfo {
     int completion_tokens = 0;
     int attempt = 0;              // planner retry index (0 = first)
     std::chrono::milliseconds latency{0};
+    // The user-turn prompt as sent (the planning prompt carries the
+    // user-profile section). Persisted for audit/contrast checks (Phase 2.3-D).
+    std::string raw_request;
 };
 
 struct RecommendationResult {

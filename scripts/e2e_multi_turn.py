@@ -26,6 +26,7 @@ Pure stdlib. Safe to run repeatedly; uses a temp dir for the DB and logs.
 """
 
 import argparse
+import codecs
 import io
 import json
 import os
@@ -108,12 +109,15 @@ def post_sse(url, payload, timeout=60):
         url, data=data, headers={"Content-Type": "application/json"}, method="POST")
     events = []
     buf = ""
+    # Incremental decoder: a multi-byte UTF-8 char can straddle a 4096-byte
+    # read boundary; decoding each chunk independently would crash there.
+    decoder = codecs.getincrementaldecoder("utf-8")()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         while True:
             chunk = resp.read(4096)
             if not chunk:
                 break
-            buf += chunk.decode("utf-8")
+            buf += decoder.decode(chunk)
             while "\n\n" in buf:
                 block, buf = buf.split("\n\n", 1)
                 line = block.strip()
@@ -127,6 +131,7 @@ def post_sse(url, payload, timeout=60):
                 except json.JSONDecodeError:
                     continue
                 events.append((env.get("event", ""), env.get("data", {})))
+        buf += decoder.decode(b"", final=True)
     return events
 
 

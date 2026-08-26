@@ -139,6 +139,8 @@ void ObservabilityStore::InitSchema() {
         );
     )");
     exec("CREATE INDEX IF NOT EXISTS idx_llm_calls_trace ON llm_calls(trace_id);");
+    // Phase 2.3-D: user-turn prompt audit (profile-injection contrast checks).
+    add_column_if_missing("llm_calls", "raw_request", "TEXT");
 }
 
 void ObservabilityStore::LogRecommendation(const RecLogEntry& e) {
@@ -184,8 +186,8 @@ void ObservabilityStore::LogLlmCall(const LlmCallEntry& e) {
     if (sqlite3_prepare_v2(db_,
             "INSERT INTO llm_calls "
             "(trace_id, session_id, purpose, model, prompt_tokens, completion_tokens, "
-            " latency_ms, status, attempt, created_at) "
-            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            " latency_ms, status, attempt, created_at, raw_request) "
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             -1, &raw, nullptr) != SQLITE_OK) {
         spdlog::warn("LogLlmCall prepare failed: {}", sqlite3_errmsg(db_));
         return;
@@ -202,6 +204,7 @@ void ObservabilityStore::LogLlmCall(const LlmCallEntry& e) {
     sqlite3_bind_text(raw, 8, e.status.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(raw, 9, e.attempt);
     sqlite3_bind_text(raw, 10, now.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(raw, 11, e.raw_request.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(raw) != SQLITE_DONE) {
         spdlog::warn("LogLlmCall insert failed: {}", sqlite3_errmsg(db_));
     }

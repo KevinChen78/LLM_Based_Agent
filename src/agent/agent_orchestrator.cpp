@@ -201,6 +201,7 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStream(
             le.completion_tokens = c.completion_tokens;
             le.attempt = c.attempt;
             le.latency_ms = c.latency.count();
+            le.raw_request = c.raw_request;
             obs_->LogLlmCall(le);
         }
     }

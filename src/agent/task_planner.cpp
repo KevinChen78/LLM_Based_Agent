@@ -84,6 +84,7 @@ coro::Task<TaskPlanner::Plan> TaskPlanner::PlanNextStep(
         info.completion_tokens = llm_resp.completion_tokens;
         info.latency = llm_resp.latency;
         info.attempt = attempt;
+        info.raw_request = prompt;   // planning prompt (carries profile section)
         if (auto j = ExtractJsonObject(llm_resp.raw_text)) {
             info.status = "success";
             plan.llm_calls.push_back(std::move(info));
