@@ -28,7 +28,8 @@ python scripts/test_pg_retrieval.py
 # 离线评估报告(读 data/observability.db + sessions.db)
 python scripts/evaluate.py
 
-# 一键起全栈:retrieval_service(:8001) + llm_gateway(:8000) + api_server(:8080,Web UI 在 /)
+# 一键起全栈:retrieval_service(:8001) + llm_gateway(:8000)
+#   + ranking_service(:8002,Phase 2.1) + api_server(:8080,Web UI 在 /)
 .\start_all.bat
 ```
 
@@ -37,9 +38,14 @@ python scripts/evaluate.py
 `python scripts/pg_embed.py` 给新增行补向量 →
 重启 retrieval_service(BM25 语料与向量通道状态都是启动时构建,不热加载)。
 
+排序模型训练流程(Phase 2.1):积累带 `candidates_json` 的推荐日志 →
+`python scripts/build_features.py`(聚合 item_features)→
+`python scripts/train_ranker.py`(样本 <100 或正样本 <10 拒绝产模型;
+`--synthetic` 冒烟)→ 重启 ranking_service(模型与特征启动时加载)。
+
 ## 架构
 
-**三进程 + 三存储**:
+**四进程 + 四存储**:
 
 - `apps/api_server`(C++,:8080,coro::net::http)— 编排、工具、会话、SSE 流式、
   托管 `web/` 前端。唯一对外的 C++ 入口。
@@ -56,10 +62,18 @@ python scripts/evaluate.py
   health 的 `vector`/`vector_model` 字段可观测。embedding 由
   `scripts/pg_embed.py` 离线生成(共享 `retrieval_service/dealtext.py` 的
   deal_text,与 BM25 语料同源)。
+- `ranking_service/main.py`(Python,:8002)— 学习式排序服务(Phase 2.1)。
+  LightGBM 模型(model.txt,`scripts/train_ranker.py` 离线训练,gitignored)+
+  只读 SQLite(item_features 来自 `data/ranking_features.db`,user_profiles
+  来自 sessions.db)。`model_loaded=false` 是合法健康态(冷启动)。特征组装
+  单点共享 `ranking_service/features.py`(训练/推理双端 import,meta.json 的
+  feature_names 校验防漂移)。允许 lightgbm pip 依赖(与检索服务同策略)。
 - 存储:PostgreSQL `groupbuy` 库(`groupbuy_items`/`merchants`/`kb_passages`,
   DDL `sql/001_schema.sql`,走查 `sql/README.md`);SQLite `data/sessions.db`
-  (sessions/turns/feedback,WAL);SQLite `data/observability.db`
-  (recommendation_logs/llm_calls,`/v1/metrics` 与 evaluate.py 读它)。
+  (sessions/turns/feedback/**user_profiles**(Phase 2.2),WAL);SQLite
+  `data/observability.db`(recommendation_logs/llm_calls,`/v1/metrics` 与
+  evaluate.py 读它);SQLite `data/ranking_features.db`(item_features,
+  `scripts/build_features.py` 离线重建)。
 
 **C++ 侧分层**(include/agent + src/):`AgentOrchestrator` 状态机
 SLOT_FILL→RETRIEVE→RANK→EXPLAIN→RESPOND→FALLBACK → `TaskPlanner`(LLM 规划,
@@ -72,7 +86,10 @@ JSON 容错解析 + 温度 0 重试)→ 工具注册表(`DealRetriever`/`DealRan
 - **降级链**:每一层外部依赖都有本地兜底——网关挂→C++ 内置 stub;
   `RETRIEVAL_SERVICE_URL` 空或检索服务挂→DealCatalog 本地子串匹配、不注册
   kb_search;PG 挂→检索服务降级 json 后端;`CATALOG_BACKEND=postgres` 但
-  PG 不可达→DealCatalog 回退 JSON 文件→内置 8 条。改任何一层都不能破坏降级链。
+  PG 不可达→DealCatalog 回退 JSON 文件→内置 8 条;ranking_service 挂/
+  无模型/`RANKER_MODE=off`→DealRanker 回退规则分(taboo 剔除永远留在
+  C++ 侧、先于模型调用);UserProfileStore 不可用/无画像→planner prompt
+  无画像段(逐字节同无画像行为)。改任何一层都不能破坏降级链。
 - **DealCatalog 三源回退**:ctor `DealCatalog(json_path, pg_dsn="")`,
   pg_dsn 非空先经 libpq 直连 `groupbuy_items`(`AGENT_HAVE_LIBPQ` 编译开关,
   CMake `ENABLE_PG_CATALOG` 自动探测 `C:/Program Files/PostgreSQL/17` 并
@@ -89,8 +106,9 @@ JSON 容错解析 + 温度 0 重试)→ 工具注册表(`DealRetriever`/`DealRan
   `/v1/retrieve/deals` 的 `total` 是 top_k 截断前的存活数;无文本命中时回退
   评分排序(score=rating/5)。
 
-**Python 依赖策略**:除检索服务(requirements.txt 的 psycopg + fastembed)外
-全部纯标准库——网关、e2e、生成器、评估脚本都不许引入 pip 依赖。
+**Python 依赖策略**:除检索服务(psycopg + fastembed)与排序服务
+(lightgbm,Phase 2.1)外全部纯标准库——网关、e2e、生成器、评估脚本都不许
+引入 pip 依赖。requirements.txt 注释标明每个包的用途范围。
 fastembed 首次加载模型需下载 ~100MB,国内网络要
 `HF_ENDPOINT=https://hf-mirror.com` + `HF_HUB_DISABLE_XET=1`。
 
@@ -105,7 +123,10 @@ CTest 已固定 `WORKING_DIRECTORY=项目根`(tests/CMakeLists.txt),
 `LLM_BASE_URL`(空=C++ 内置 stub 离线模式)、`RETRIEVAL_SERVICE_URL`、
 `RETRIEVAL_BACKEND` / `RETRIEVAL_VECTOR` / `PG_DSN`(检索服务,见
 retrieval_service/.env.example)、`CATALOG_BACKEND`(api_server,默认 json,
-postgres 时复用 `PG_DSN`)、`PG_TEST_DSN`(设置后 DealCatalog live-PG 用例不 SKIP)、
+postgres 时复用 `PG_DSN`)、`RANKER_SERVICE_URL` / `RANKER_MODE`(off|shadow|
+active)/ `RANKER_TREATMENT_PCT` / `RANKER_EXPERIMENT`(api_server,
+Phase 2.1 学习排序与 A/B 分桶;ranking_service 侧见
+ranking_service/.env.example)、`PG_TEST_DSN`(设置后 DealCatalog live-PG 用例不 SKIP)、
 `DEALS_CATALOG_PATH`、`OBS_DB_PATH`、`WEB_DIR`。
 `.env` 加载是 setdefault 语义且 .env 先于 .env.local——同名键 .env 赢,每个键只定义一处。
 

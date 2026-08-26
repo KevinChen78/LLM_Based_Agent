@@ -19,3 +19,12 @@ llm_gateway/.env.local
 llm_gateway/.env
 retrieval_service/.env.local
 retrieval_service/.env
+ranking_service/.env.local
+ranking_service/.env
+
+# Phase 2.1 training artifacts (regenerate via scripts/train_ranker.py)
+ranking_service/model.txt
+ranking_service/meta.json
+
+# Python caches
+__pycache__/

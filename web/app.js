@@ -21,7 +21,19 @@
     sessionId: null,
     streaming: false,
     controller: null,
-    userId: 'web-user'
+    userId: (function () {
+      // Phase 2.2: 持久匿名用户 ID,支撑跨会话用户画像与 A/B 分桶。
+      try {
+        var id = window.localStorage.getItem('agent_user_id');
+        if (!id) {
+          id = (window.crypto && crypto.randomUUID)
+            ? crypto.randomUUID()
+            : 'u-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+          window.localStorage.setItem('agent_user_id', id);
+        }
+        return id;
+      } catch (e) { return 'web-user'; }
+    })()
   };
 
   try {

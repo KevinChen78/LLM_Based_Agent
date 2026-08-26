@@ -463,25 +463,61 @@ BM25 委托/回退/无 client 不回归）与 [tests/test_composer.cpp](tests/te
 核心推荐闭环、反馈闭环、观测评估闭环均已闭合。以下是从"可演示 Agent"走向
 "生产级推荐系统"的增量项，按优先级排序（对应《项目规划_修订版.md》Phase 2）：
 
-### 2.1 学习式排序（反馈数据 → 排序优化）
+### 2.1 学习式排序（反馈数据 → 排序优化）—— **已完成（首版）**
 
-反馈表已开始积累 like/dislike 信号，这是排序学习的数据基础。
+反馈表已开始积累 like/dislike 信号，这是排序学习的数据基础。本迭代落地：
 
-- **特征存储**：`item_features` 表（CTR/CVR/7 日点击订单、类目热度），由
-  `feedback` + `recommendation_logs` 离线聚合生成（可先 SQL 脚本，后 Flink/Spark）。
-- **排序模型服务**：Python gRPC/HTTP 服务（LightGBM 起步），C++ 侧新增
-  `RankerClient` 替代/包裹现有规则排序 `DealRanker`，支持影子模式（模型分与
-  规则分同时记录，便于对比）。
-- **A/B 实验**：`ExperimentManager`（按 user_id 哈希分桶），实验组走模型分、
-  对照组走规则分，用 `feedback` 满意率与推荐日志点击率评估提升。
-- **成功标准**（修订版）：点击率/转化率优于规则基线 10%+。
+- **候选集埋点**：`recommendation_logs` 幂等加列 `candidates_json`（ranker
+  输入侧全候选 + 规则分/模型分，cap 50）/ `experiment_group` / `rank_mode`，
+  由 `DealRanker` 经 `rank_audit` 顶层字段回传（不改 ITool 接口）。
+- **特征存储**：`scripts/build_features.py`（纯 stdlib，幂等）聚合
+  `candidates_json` 曝光 + `feedback` 反馈 → `data/ranking_features.db` 的
+  `item_features` 表（impressions/likes/dislikes/category_hot）。
+- **排序模型服务**：`ranking_service/main.py`（:8002，LightGBM，requirements.txt
+  新增 `lightgbm>=4.0,<5` 仅限此服务与训练脚本）。`GET /v1/health` 报
+  `model_loaded`/`feature_rows`/`profiles_available`；`POST /v1/rank` 收
+  candidates+context 回 `{item_id, model_score}`。特征组装单点共享
+  `ranking_service/features.py`（训练/推理双端 import，meta.json 存
+  feature_names 校验，杜绝漂移）。`model_loaded=false` 是合法健康态（冷启动），
+  C++ 回退规则分。
+- **训练**：`scripts/train_ranker.py` —— LambdaRank（group=trace_id），
+  label：like=1/dislike=0/无反馈忽略（`--implicit-negatives` 可选）；
+  样本 <100 或正样本 <10 拒绝产模型（链路自动回退规则分）；
+  `--synthetic` 合成数据冒烟。产物 `ranking_service/model.txt` + `meta.json`
+  （已 gitignore）。
+- **C++ 接线**：`RankerClient`（全 virtual，仿 RetrievalClient，超时收紧至
+  2s）注入 `DealRanker`；taboo 剔除始终留在 C++ 侧、先于任何模型调用。
+  `rank_mode` 观测三种生效路径：`model` / `rule` / `rule_fallback`。
+- **A/B 实验**：`ExperimentManager`（FNV-1a(user_id) % 100 分桶，空 user_id
+  恒 control）。`RANKER_MODE=off|shadow|active` + `RANKER_TREATMENT_PCT` +
+  `RANKER_EXPERIMENT`；shadow 模式规则分服务、模型分只入审计。
+- **评估**：`evaluate.py` 新增「排序/实验对比」段——分组满意率
+  （feedback 按 trace_id 回连，样本 <30 标注）、rank_mode 分布与模型回退率、
+  位置敏感度（like 率 by 推荐位置）。
+- **成功标准**（修订版）：点击率/转化率优于规则基线 10%+ —— 待数据积累后
+  用实验对比段验证。
+- 训练流程：`python scripts/build_features.py` → `python scripts/train_ranker.py`
+  → 重启 ranking_service（模型/特征启动时加载，不热加载）。
 
-### 2.2 用户画像与长期记忆
+### 2.2 用户画像与长期记忆 —— **已完成（首版）**
 
-- `UserProfileStore`（常驻城市/类目偏好/价格敏感度/忌口标签）+
-  `PreferenceExtractor`：从历史会话与反馈中抽取偏好，planner prompt 注入
-  "用户画像"段，让"老用户少被追问、推荐更贴身"。
-- 会话记忆从 SQLite 迁 Redis（短期 TTL）+ PostgreSQL（持久化），支撑多实例部署。
+- **UserProfileStore**（`include/agent/user_profile_store.hpp` +
+  `src/memory/sqlite_user_profile_store.cpp`）：`user_profiles` 表与
+  sessions/feedback 同库（`data/sessions.db`）、独立连接（WAL + busy_timeout），
+  不污染 SessionMemoryStore 接口；PG 终态 DDL 见 `sql/003_user_profiles.sql`
+  （本轮不迁移）。
+- **PreferenceExtractor**（规则式、确定性、纯函数可单测，不用 LLM）：like 的
+  item 反查 catalog 聚合 category/city top-3（like +1 / dislike -1）、budget
+  均值、taboo 去重入 dietary_tags、price_sensitivity = like 中 discount>0.3
+  占比。请求时惰性计算 + 5 分钟缓存（`updated_at` 字符串比较）。
+- **planner prompt 注入**：`PromptBuilder::TaskPlanningPrompt` 第 4 参
+  `user_profile_json`（默认空）；画像段插在 `# 当前已填充槽位` 之前，规则明示
+  「当轮显式输入永远优先于画像」；空画像时段落完全不出现（prompt 逐字节同前）。
+- **前端**：`web/app.js` 的 user_id 从硬编码 `web-user` 改为 localStorage
+  持久 UUID（`crypto.randomUUID`，兜底时间戳随机串），画像与 A/B 分桶才真正
+  分用户。
+- 会话记忆从 SQLite 迁 Redis（短期 TTL）+ PostgreSQL（持久化），支撑多实例部署——
+  待 2.4 多实例需求出现时再做。
 
 ### 2.3 数据层升级 —— **已完成**
 
