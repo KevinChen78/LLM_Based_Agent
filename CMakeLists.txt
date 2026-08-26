@@ -95,6 +95,55 @@ if(WIN32)
 endif()
 
 # -----------------------------------------------------------------------------
+# Optional libpq (PostgreSQL-backed DealCatalog). Auto-degrades to JSON-only
+# when libpq is not found — the C++ source guards on AGENT_HAVE_LIBPQ.
+# -----------------------------------------------------------------------------
+option(ENABLE_PG_CATALOG "PostgreSQL-backed DealCatalog via libpq" ON)
+set(PG_ROOT "C:/Program Files/PostgreSQL/17" CACHE PATH "PostgreSQL install root")
+
+if(ENABLE_PG_CATALOG)
+    find_path(LIBPQ_INCLUDE_DIR libpq-fe.h HINTS "${PG_ROOT}/include")
+    find_library(LIBPQ_LIBRARY NAMES pq libpq HINTS "${PG_ROOT}/lib")
+    if(LIBPQ_INCLUDE_DIR AND LIBPQ_LIBRARY)
+        message(STATUS "libpq found: ${LIBPQ_LIBRARY}")
+        set(AGENT_HAVE_LIBPQ ON)
+    else()
+        message(WARNING "libpq not found under PG_ROOT=${PG_ROOT}; building without PG catalog")
+    endif()
+endif()
+
+if(AGENT_HAVE_LIBPQ)
+    target_include_directories(agent_core PRIVATE "${LIBPQ_INCLUDE_DIR}")
+    # PUBLIC so the link propagates to api_server and test_agent.
+    target_link_libraries(agent_core PUBLIC "${LIBPQ_LIBRARY}")
+    target_compile_definitions(agent_core PRIVATE AGENT_HAVE_LIBPQ=1)
+endif()
+
+# libpq runtime DLL staging helper — must be DEFINED before the subdirectories
+# that call it (the call site must be in the same directory scope as the exe
+# target for add_custom_command(TARGET) to work).
+if(AGENT_HAVE_LIBPQ AND WIN32)
+    # libpq.dll + its runtime deps must sit next to the executables.
+    # (Verify with: dumpbin /dependents <PG_ROOT>/bin/libpq.dll)
+    set(LIBPQ_RUNTIME_DLLS
+        "${PG_ROOT}/bin/libpq.dll"
+        "${PG_ROOT}/bin/libssl-3-x64.dll"
+        "${PG_ROOT}/bin/libcrypto-3-x64.dll"
+        "${PG_ROOT}/bin/libiconv-2.dll"
+        "${PG_ROOT}/bin/libintl-9.dll"
+        "${PG_ROOT}/bin/libwinpthread-1.dll")
+    function(stage_libpq_dlls tgt)
+        foreach(dll ${LIBPQ_RUNTIME_DLLS})
+            if(EXISTS "${dll}")
+                add_custom_command(TARGET ${tgt} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${dll}" "$<TARGET_FILE_DIR:${tgt}>")
+            endif()
+        endforeach()
+    endfunction()
+endif()
+
+# -----------------------------------------------------------------------------
 # Subdirectories
 # -----------------------------------------------------------------------------
 add_subdirectory(apps/api_server)

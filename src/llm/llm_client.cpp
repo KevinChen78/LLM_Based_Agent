@@ -446,6 +446,7 @@ coro::Task<LlmResponse> HttpLlmClient::Chat(
         }
         resp.prompt_tokens = j.value("usage", nlohmann::json::object()).value("prompt_tokens", 0);
         resp.completion_tokens = j.value("usage", nlohmann::json::object()).value("completion_tokens", 0);
+        resp.model = j.value("model", "");
         healthy_ = true;
     } catch (const std::exception& e) {
         spdlog::error("LLM HTTP exception: {}", e.what());

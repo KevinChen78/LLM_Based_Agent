@@ -17,3 +17,5 @@ ftp_root/
 # Secrets — local LLM credentials, never commit
 llm_gateway/.env.local
 llm_gateway/.env
+retrieval_service/.env.local
+retrieval_service/.env

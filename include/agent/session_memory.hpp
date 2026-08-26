@@ -41,6 +41,18 @@ public:
         const std::string& session_id,
         const std::string& state,
         const nlohmann::json& slots) = 0;
+
+    // One piece of user feedback on a reply (item_id empty) or a single deal
+    // card. FK semantics mirror AppendTurn: unknown session_id is an error.
+    struct FeedbackRecord {
+        std::string session_id;
+        std::string trace_id;
+        std::string item_id;        // empty = whole-reply feedback
+        std::string feedback_type;  // like / dislike
+        std::string comment;        // optional
+    };
+
+    virtual coro::Task<Status> AppendFeedback(const FeedbackRecord& rec) = 0;
 };
 
 // In-memory implementation for Phase 0
@@ -63,6 +75,8 @@ public:
         const std::string& state,
         const nlohmann::json& slots) override;
 
+    coro::Task<Status> AppendFeedback(const FeedbackRecord& rec) override;
+
 private:
     struct Data {
         Session session;
@@ -71,6 +85,7 @@ private:
 
     std::mutex mutex_;
     std::unordered_map<std::string, Data> sessions_;
+    std::vector<FeedbackRecord> feedback_;
     int next_turn_id_ = 0;
 };
 

@@ -32,7 +32,11 @@ namespace agent {
 // }
 class DealCatalog {
 public:
-    explicit DealCatalog(const std::string& json_path);
+    // pg_dsn empty  => JSON file only (historical behaviour).
+    // pg_dsn set    => try PostgreSQL (groupbuy_items) first; on any failure
+    //                  fall back to the JSON file, then the built-in dataset.
+    explicit DealCatalog(const std::string& json_path,
+                         const std::string& pg_dsn = "");
 
     // Returns a deep copy of all deals as a JSON array.
     nlohmann::json Deals() const;
@@ -40,13 +44,18 @@ public:
     bool Loaded() const { return loaded_; }
     size_t Size() const;
 
+    // "postgres" | "file:<path>" | "builtin" — which source won, for logging.
+    const std::string& Source() const { return source_; }
+
 private:
     void LoadFromFile(const std::string& path);
+    bool LoadFromPostgres(const std::string& dsn);   // false => caller falls through
     static nlohmann::json BuiltInFallback();
 
     mutable std::mutex mutex_;
     nlohmann::json deals_;   // always a JSON array
     bool loaded_ = false;
+    std::string source_;
 };
 
 } // namespace agent

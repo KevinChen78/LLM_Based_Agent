@@ -8,6 +8,7 @@
 #include "agent/deal_catalog.hpp"
 #include "agent/deal_tools.hpp"
 #include "agent/llm_client.hpp"
+#include "agent/observability_store.hpp"
 #include "agent/response_composer.hpp"
 #include "agent/retrieval_client.hpp"
 #include "agent/safety_guard.hpp"
@@ -101,12 +102,6 @@ void ServeStaticFile(Response& resp, const std::string& web_dir, const std::stri
 // Helpers
 // ---------------------------------------------------------------------------
 
-std::string GenerateTraceId() {
-    static int counter = 0;
-    auto now = std::chrono::system_clock::now().time_since_epoch().count();
-    return "t-" + std::to_string(now) + "-" + std::to_string(++counter);
-}
-
 json ToJson(const RecommendationResult& r) {
     json j;
     j["session_id"] = r.session_id;
@@ -156,10 +151,25 @@ int main() {
     // Retrieval / ranking: real catalog-backed backend (default and only wired
     // backend). MockRetriever / MockRanker remain in the codebase as a Phase-0
     // reference implementation but are not registered here.
-    //   DEALS_CATALOG_PATH — override the catalog JSON path (default data/deals.json).
+    //   CATALOG_BACKEND  — json (default, hermetic) | postgres (libpq catalog;
+    //                      falls back to the JSON file, then the built-in dataset)
+    //   PG_DSN           — libpq conninfo, required when CATALOG_BACKEND=postgres
+    //                      (same name as the retrieval service uses)
+    //   DEALS_CATALOG_PATH — catalog JSON path (default data/deals.json); the
+    //                      fallback when the PG load fails.
+    const char* backend_env = std::getenv("CATALOG_BACKEND");
+    std::string catalog_backend = backend_env ? backend_env : "json";
     const char* catalog_env = std::getenv("DEALS_CATALOG_PATH");
     std::string catalog_path = catalog_env ? catalog_env : "data/deals.json";
-    auto catalog = std::make_shared<DealCatalog>(catalog_path);
+    std::string pg_dsn;
+    if (catalog_backend == "postgres") {
+        const char* dsn_env = std::getenv("PG_DSN");
+        pg_dsn = dsn_env ? dsn_env : "";
+        if (pg_dsn.empty()) {
+            std::cout << "CATALOG_BACKEND=postgres but PG_DSN is empty; using JSON catalog" << std::endl;
+        }
+    }
+    auto catalog = std::make_shared<DealCatalog>(catalog_path, pg_dsn);
     // Retrieval service (BM25 over deals + knowledge base). Enabled by setting
     //   RETRIEVAL_SERVICE_URL=http://localhost:8001
     // When set: DealRetriever delegates text ranking to BM25 and the kb_search
@@ -170,7 +180,8 @@ int main() {
     auto retrieval = std::make_shared<RetrievalClient>(retr_url);
     tools->Register(std::make_shared<DealRetriever>(catalog, retrieval));
     tools->Register(std::make_shared<DealRanker>());
-    std::cout << "Retrieval backend: Catalog (" << catalog_path
+    std::cout << "Retrieval backend: Catalog (backend=" << catalog_backend
+              << ", source=" << catalog->Source()
               << ", " << catalog->Size() << " deals)" << std::endl;
     if (retrieval->Enabled()) {
         tools->Register(std::make_shared<KnowledgeRetriever>(retrieval));
@@ -186,19 +197,27 @@ int main() {
     const char* store_env = std::getenv("SESSION_STORE");
     std::string store_kind = store_env ? store_env : "sqlite";
     std::shared_ptr<SessionMemoryStore> memory;
+    std::string sessions_db_path;   // empty when SESSION_STORE=memory
     if (store_kind == "memory") {
         memory = std::make_shared<InMemorySessionStore>();
         std::cout << "Session store: InMemory" << std::endl;
     } else {
         const char* path_env = std::getenv("SESSION_DB_PATH");
-        std::string db_path = path_env ? path_env : "data/sessions.db";
-        memory = std::make_shared<SqliteSessionStore>(db_path);
-        std::cout << "Session store: SQLite (" << db_path << ")" << std::endl;
+        sessions_db_path = path_env ? path_env : "data/sessions.db";
+        memory = std::make_shared<SqliteSessionStore>(sessions_db_path);
+        std::cout << "Session store: SQLite (" << sessions_db_path << ")" << std::endl;
     }
+    // Audit trail: one recommendation_logs row per request + one llm_calls row
+    // per LLM call, in its own DB so it never contends with session traffic.
+    //   OBS_DB_PATH — default data/observability.db
+    const char* obs_env = std::getenv("OBS_DB_PATH");
+    std::string obs_db_path = obs_env ? obs_env : "data/observability.db";
+    auto obs = std::make_shared<ObservabilityStore>(obs_db_path);
+    std::cout << "Observability: SQLite (" << obs_db_path << ")" << std::endl;
     auto composer = std::make_shared<ResponseComposer>(llm);
     auto guard = std::make_shared<SafetyGuard>();
     auto orchestrator = std::make_shared<AgentOrchestrator>(
-        planner, tools, memory, llm, composer, guard);
+        planner, tools, memory, llm, composer, guard, obs);
 
     // Web UI static assets. Served from WEB_DIR (default "web", relative to
     // cwd) on the same origin as the API, so no CORS is needed. The coro
@@ -277,12 +296,54 @@ int main() {
             }
             co_return;
         })
-        .post("/v1/feedback", [](const Request& req, Response& resp) -> Task<void> {
-            resp.json(json{{"success", true}}.dump());
+        .post("/v1/feedback", [memory](const Request& req, Response& resp) -> Task<void> {
+            try {
+                auto body = json::parse(req.body());
+                SessionMemoryStore::FeedbackRecord rec;
+                rec.session_id = body.value("session_id", "");
+                rec.trace_id = body.value("trace_id", "");
+                rec.item_id = body.value("item_id", "");
+                rec.feedback_type = body.value("feedback_type", "");
+                rec.comment = body.value("comment", "");
+
+                if (rec.session_id.empty()) {
+                    resp.status(coro::net::http::Status::BadRequest)
+                        .json(json{{"success", false}, {"error", "session_id is required"}}.dump());
+                    co_return;
+                }
+                if (rec.feedback_type != "like" && rec.feedback_type != "dislike") {
+                    resp.status(coro::net::http::Status::BadRequest)
+                        .json(json{{"success", false},
+                                   {"error", "feedback_type must be like|dislike"}}.dump());
+                    co_return;
+                }
+
+                auto st = co_await memory->AppendFeedback(rec);
+                if (!st.ok()) {
+                    resp.status(coro::net::http::Status::BadRequest)
+                        .json(json{{"success", false}, {"error", st.message}}.dump());
+                    co_return;
+                }
+                resp.json(json{{"success", true}}.dump());
+            } catch (const std::exception& e) {
+                spdlog::error("Error handling /v1/feedback: {}", e.what());
+                resp.status(coro::net::http::Status::InternalServerError)
+                    .json(json{{"success", false}, {"error", e.what()}}.dump());
+            }
             co_return;
         })
         .get("/v1/health", [](const Request& req, Response& resp) -> Task<void> {
             resp.json(json{{"status", "ok"}}.dump());
+            co_return;
+        })
+        .get("/v1/metrics", [obs, sessions_db_path](const Request& req, Response& resp) -> Task<void> {
+            try {
+                resp.json(obs->Aggregate(sessions_db_path).dump());
+            } catch (const std::exception& e) {
+                spdlog::error("Error handling /v1/metrics: {}", e.what());
+                resp.status(coro::net::http::Status::InternalServerError)
+                    .json(json{{"error", e.what()}}.dump());
+            }
             co_return;
         })
         // Static web UI (flat web/ dir; each asset gets an exact GET route).

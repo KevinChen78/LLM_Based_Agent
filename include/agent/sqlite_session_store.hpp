@@ -39,6 +39,8 @@ public:
         const std::string& state,
         const nlohmann::json& slots) override;
 
+    coro::Task<Status> AppendFeedback(const FeedbackRecord& rec) override;
+
 private:
     void InitSchema();
 

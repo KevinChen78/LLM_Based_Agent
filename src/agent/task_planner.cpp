@@ -15,6 +15,7 @@ void ApplyPlanJson(const nlohmann::json& j, TaskPlanner::Plan& plan) {
     plan.next_state = j.value("action", "FALLBACK");
     plan.slots = j.value("slots", nlohmann::json::object());
     plan.missing_slots = j.value("missing_slots", std::vector<std::string>{});
+    plan.direct_response = j.value("response", "");
 
     auto cq = j.value("clarification_question", "");
     if (!cq.empty()) {
@@ -73,10 +74,22 @@ coro::Task<TaskPlanner::Plan> TaskPlanner::PlanNextStep(
     // retry covers the rest before we give up and FALLBACK.
     for (int attempt = 0; attempt < 2; ++attempt) {
         auto llm_resp = co_await llm_->Chat(messages, options);
+        // Record every attempt for the llm_calls audit trail.
+        LlmCallInfo info;
+        info.purpose = "plan";
+        info.model = llm_resp.model.empty() ? options.model : llm_resp.model;
+        info.prompt_tokens = llm_resp.prompt_tokens;
+        info.completion_tokens = llm_resp.completion_tokens;
+        info.latency = llm_resp.latency;
+        info.attempt = attempt;
         if (auto j = ExtractJsonObject(llm_resp.raw_text)) {
+            info.status = "success";
+            plan.llm_calls.push_back(std::move(info));
             ApplyPlanJson(*j, plan);
             co_return plan;
         }
+        info.status = "parse_error";
+        plan.llm_calls.push_back(std::move(info));
         if (attempt == 0) {
             spdlog::warn("TaskPlanner: plan JSON unparseable ({}...), retrying at temperature=0",
                          llm_resp.raw_text.substr(0, 80));

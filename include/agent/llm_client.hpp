@@ -25,6 +25,7 @@ struct LlmMessage {
 
 struct LlmResponse {
     std::string raw_text;
+    std::string model;            // echo of the upstream model field (may be empty)
     int prompt_tokens = 0;
     int completion_tokens = 0;
     std::chrono::milliseconds latency{0};

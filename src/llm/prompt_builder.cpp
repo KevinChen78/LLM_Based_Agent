@@ -43,8 +43,10 @@ std::string PromptBuilder::TaskPlanningPrompt(
 3. 召回之后若用户有明确预算/人数/禁忌，可再追加一个 deal_ranker 工具调用做精排
    （candidates 留空，系统会自动注入上一步召回结果）。
 4. 当用户询问事实/政策类问题（发票、预约、退款、包间、停车、儿童、忌口/过敏、
-   配送、会员、营业时间、核销等）时，额外追加一个 kb_search 工具调用检索知识库，
-   以便回答有据可依；若用户同时要推荐商品，kb_search 与 deal_retriever 可一起返回。
+   配送、会员、营业时间、核销等）时，必须追加一个 kb_search 工具调用检索知识库，
+   以便回答有据可依；若用户同时要推荐商品，kb_search 与 deal_retriever 可一起返回；
+   若用户只问事实问题而没有推荐需求，action 同样为 "retrieve"，tool_calls 只包含
+   kb_search（此时不受规则 1 的槽位缺失限制，不需要追问）。
 5. 不要编造用户没有提到的信息。
 6. 输出必须是合法 JSON，不要包含任何 Markdown 代码块标记。
 

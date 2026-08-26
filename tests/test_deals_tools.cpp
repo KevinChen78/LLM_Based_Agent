@@ -116,12 +116,26 @@ TEST(DealRetriever, StampsReasonAndScore) {
     }
 }
 
-// Loads the full data/deals.json (which now contains 100 Wuhan records) and
-// confirms the real retriever filters Wuhan correctly across city / category /
-// price constraints.
+// Loads the full data/deals.json and confirms the real retriever filters
+// Wuhan correctly across city / category / price constraints. Expected counts
+// are derived from the catalog itself so regenerating the data at a different
+// scale (scripts/gen_wuhan_deals.py) does not break this test.
 TEST(DealRetriever, FiltersWuhanFromCatalog) {
     auto catalog = std::make_shared<DealCatalog>("data/deals.json");
-    ASSERT_GE(catalog->Size(), 120u);
+    ASSERT_GE(catalog->Size(), 5000u);
+
+    // Ground truth straight from the catalog.
+    size_t wuhan = 0, wuhan_xlk = 0, wuhan_cheap = 0;
+    for (const auto& d : catalog->Deals()) {
+        if (d.value("city", "") != "武汉") continue;
+        ++wuhan;
+        if (d.value("category", "") == "小龙虾") ++wuhan_xlk;
+        if (d.value("price", 0.0) <= 200.0) ++wuhan_cheap;
+    }
+    ASSERT_GT(wuhan, 0u);
+    ASSERT_GT(wuhan_xlk, 0u);
+    ASSERT_GT(wuhan_cheap, 0u);
+
     DealRetriever retriever(catalog);
 
     auto run = [&](const json& args) {
@@ -134,20 +148,22 @@ TEST(DealRetriever, FiltersWuhanFromCatalog) {
         return json::parse(r.result_json);
     };
 
-    // All 100 Wuhan deals.
-    auto all = run({{"city", "武汉"}, {"top_k", 200}});
-    EXPECT_EQ(all["items"].size(), 100u);
+    const int k = static_cast<int>(wuhan);
+
+    // All Wuhan deals.
+    auto all = run({{"city", "武汉"}, {"top_k", k}});
+    EXPECT_EQ(all["items"].size(), wuhan);
     for (const auto& it : all["items"]) {
         EXPECT_EQ(it["city"], "武汉");
     }
 
-    // Category filter: 小龙虾 (data has 15 Wuhan crawfish deals).
-    auto xlk = run({{"city", "武汉"}, {"category", "小龙虾"}, {"top_k", 200}});
-    EXPECT_EQ(xlk["items"].size(), 15u);
+    // Category filter: 小龙虾.
+    auto xlk = run({{"city", "武汉"}, {"category", "小龙虾"}, {"top_k", k}});
+    EXPECT_EQ(xlk["items"].size(), wuhan_xlk);
 
-    // Price filter: price <= 200 (24 such Wuhan deals per the dataset).
-    auto cheap = run({{"city", "武汉"}, {"max_price", 200.0}, {"top_k", 200}});
-    EXPECT_EQ(cheap["items"].size(), 24u);
+    // Price filter: price <= 200.
+    auto cheap = run({{"city", "武汉"}, {"max_price", 200.0}, {"top_k", k}});
+    EXPECT_EQ(cheap["items"].size(), wuhan_cheap);
     for (const auto& it : cheap["items"]) {
         EXPECT_LE(it["price"].get<double>(), 200.0);
     }

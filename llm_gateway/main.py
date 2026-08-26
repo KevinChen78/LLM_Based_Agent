@@ -112,13 +112,24 @@ def make_plan(user_message):
             },
             "missing_slots": [],
             "clarification_question": "",
-            "tool_calls": [{
-                "tool_name": "mock_retriever",
-                "arguments": {
-                    "city": "上海", "category": "海鲜", "max_price": 300,
-                    "people": 3, "keywords": "", "top_k": 20,
+            # Tool names must match what api_server registers (deal_retriever /
+            # deal_ranker) — a stale name here makes retrieval silently empty.
+            "tool_calls": [
+                {
+                    "tool_name": "deal_retriever",
+                    "arguments": {
+                        "city": "上海", "category": "海鲜", "max_price": 300,
+                        "people": 3, "keywords": "", "top_k": 20,
+                    },
                 },
-            }],
+                {
+                    "tool_name": "deal_ranker",
+                    "arguments": {
+                        "candidates": [], "budget": 300, "people": 3,
+                        "taboo": "", "top_n": 3,
+                    },
+                },
+            ],
         }
 
     if "吃" in user_message or "想" in user_message:

@@ -85,4 +85,14 @@ coro::Task<Status> InMemorySessionStore::UpdateContext(
     co_return Status::OK();
 }
 
+coro::Task<Status> InMemorySessionStore::AppendFeedback(const FeedbackRecord& rec) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (sessions_.find(rec.session_id) == sessions_.end()) {
+        // Same contract as the SQLite FK: unknown session is an error.
+        co_return Status::Error(1, "session not found: " + rec.session_id);
+    }
+    feedback_.push_back(rec);
+    co_return Status::OK();
+}
+
 } // namespace agent

@@ -1,0 +1,9 @@
+# Python dependencies — only needed for the default PostgreSQL retrieval
+# backend. llm_gateway and `RETRIEVAL_BACKEND=json` remain pure stdlib.
+# psycopg[binary] ships prebuilt wheels for Windows/py3.13 (no compiler needed);
+# the pool extra provides the thread-safe ConnectionPool for ThreadingHTTPServer.
+psycopg[binary,pool]>=3.2,<4
+
+# Vector recall (RETRIEVAL_VECTOR=on): ONNX-runtime embeddings, no torch.
+# Ships Windows/py3.13 wheels; pulls onnxruntime.
+fastembed>=0.4,<1

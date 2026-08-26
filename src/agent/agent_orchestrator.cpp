@@ -3,14 +3,16 @@
 #include "agent/tool_registry.hpp"
 #include "agent/session_memory.hpp"
 #include "agent/llm_client.hpp"
+#include "agent/observability_store.hpp"
 #include "agent/response_composer.hpp"
 #include "agent/safety_guard.hpp"
 
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <functional>
-#include <random>
 #include <string_view>
 
 namespace agent {
@@ -18,9 +20,9 @@ namespace agent {
 namespace {
 
 std::string GenerateTraceId() {
-    static std::mt19937 rng{std::random_device{}()};
-    std::uniform_int_distribution<int> dist(100000, 999999);
-    return "t-" + std::to_string(dist(rng));
+    static std::atomic<int> counter{0};
+    auto now = std::chrono::system_clock::now().time_since_epoch().count();
+    return "t-" + std::to_string(now) + "-" + std::to_string(++counter);
 }
 
 void EmitIf(const std::shared_ptr<StreamEmitter>& emitter,
@@ -58,13 +60,15 @@ AgentOrchestrator::AgentOrchestrator(
     std::shared_ptr<SessionMemoryStore> memory,
     std::shared_ptr<LlmClient> llm,
     std::shared_ptr<ResponseComposer> composer,
-    std::shared_ptr<SafetyGuard> guard)
+    std::shared_ptr<SafetyGuard> guard,
+    std::shared_ptr<ObservabilityStore> obs)
     : planner_(std::move(planner))
     , tools_(std::move(tools))
     , memory_(std::move(memory))
     , llm_(std::move(llm))
     , composer_(std::move(composer))
-    , guard_(std::move(guard)) {}
+    , guard_(std::move(guard))
+    , obs_(std::move(obs)) {}
 
 coro::Task<RecommendationResult> AgentOrchestrator::Chat(Request req) {
     // Non-streaming path: use the streaming implementation with a null emitter.
@@ -73,6 +77,59 @@ coro::Task<RecommendationResult> AgentOrchestrator::Chat(Request req) {
 
 coro::Task<RecommendationResult> AgentOrchestrator::ChatStream(
     Request req, std::shared_ptr<StreamEmitter> emitter) {
+    // Outer shell: time the whole request and persist one recommendation_logs
+    // row plus one llm_calls row per LLM call, no matter which of the inner
+    // paths (blocked / clarify / respond / retrieve / error) produced it.
+    const auto start = std::chrono::steady_clock::now();
+    const std::string user_id = req.user_context.user_id;
+    const std::string user_message = req.user_message;
+
+    RecAudit audit;
+    auto result = co_await ChatStreamInner(
+        std::move(req), std::move(emitter), obs_ ? &audit : nullptr);
+
+    if (obs_) {
+        ObservabilityStore::RecLogEntry e;
+        e.trace_id = result.trace_id;
+        e.session_id = result.session_id;
+        e.user_id = user_id;
+        e.request_text = user_message;
+        e.action = result.next_state;
+        e.slots_json = audit.slots_json.empty() ? "{}" : audit.slots_json;
+        e.item_count = static_cast<int>(result.items.size());
+        auto ranked = nlohmann::json::array();
+        for (size_t i = 0; i < result.items.size() && i < 5; ++i) {
+            ranked.push_back({{"item_id", result.items[i].item_id},
+                              {"score", result.items[i].score}});
+        }
+        e.ranked_items_json = ranked.dump();
+        e.response_text = result.response_text;
+        e.grounding_count = static_cast<int>(result.grounding.size());
+        e.compose_mode = result.compose_mode.empty() ? "none" : result.compose_mode;
+        e.latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        obs_->LogRecommendation(e);
+
+        for (const auto& c : audit.llm_calls) {
+            ObservabilityStore::LlmCallEntry le;
+            le.trace_id = result.trace_id;
+            le.session_id = result.session_id;
+            le.purpose = c.purpose;
+            le.model = c.model;
+            le.status = c.status;
+            le.prompt_tokens = c.prompt_tokens;
+            le.completion_tokens = c.completion_tokens;
+            le.attempt = c.attempt;
+            le.latency_ms = c.latency.count();
+            obs_->LogLlmCall(le);
+        }
+    }
+
+    co_return result;
+}
+
+coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
+    Request req, std::shared_ptr<StreamEmitter> emitter, RecAudit* audit) {
     RecommendationResult result;
     result.trace_id = GenerateTraceId();
 
@@ -126,6 +183,10 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStream(
         EmitIf(emitter, "planning", nlohmann::json{{"detail", "deciding next step"}});
         auto plan = co_await planner_->PlanNextStep(
             req.user_context, history, req.user_message, session.context);
+        if (audit) {
+            audit->slots_json = plan.slots.dump();
+            for (auto& c : plan.llm_calls) audit->llm_calls.push_back(std::move(c));
+        }
 
         result.next_state = plan.next_state;
         EmitIf(emitter, "plan", nlohmann::json{
@@ -143,6 +204,20 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStream(
                 result.response_text = "请问您能提供更多信息吗？例如城市、人数和预算。";
             }
             co_await memory_->UpdateContext(session.session_id, "SLOT_FILL", plan.slots);
+            co_await memory_->AppendTurn(session.session_id,
+                ConversationTurn{.role = "assistant", .content = result.response_text});
+            FinishIf(emitter, result);
+            co_return result;
+        }
+
+        // 6.5 Handle direct respond (chitchat / thanks): the planner's canned
+        // reply is the answer — running the recommendation pipeline here would
+        // compose over zero items and mislead with "no matching deals".
+        if (plan.next_state == "respond") {
+            result.response_text = plan.direct_response.empty()
+                ? "您好，我可以帮您推荐团购套餐，请告诉我城市、人数和预算。"
+                : plan.direct_response;
+            co_await memory_->UpdateContext(session.session_id, "RESPOND", plan.slots);
             co_await memory_->AppendTurn(session.session_id,
                 ConversationTurn{.role = "assistant", .content = result.response_text});
             FinishIf(emitter, result);
@@ -273,6 +348,10 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStream(
             req.user_message, plan.slots, items, emitter, grounding_text);
         result.response_text = composed.response_text;
         result.items = std::move(composed.items);
+        result.compose_mode = composed.compose_mode;
+        if (audit) {
+            for (auto& c : composed.llm_calls) audit->llm_calls.push_back(std::move(c));
+        }
         result.is_clarifying = false;
 
         // 9. Output safety guard: mask PII / strip banned words before returning.

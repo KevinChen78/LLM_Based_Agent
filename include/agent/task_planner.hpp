@@ -20,6 +20,11 @@ public:
         std::vector<std::string> missing_slots;
         std::optional<ClarificationQuestion> clarification;
         std::vector<ToolCall> tool_calls;
+        // Canned reply for action=="respond" (chitchat / thanks) — used
+        // directly instead of running the recommendation pipeline.
+        std::string direct_response;
+        // One entry per LLM attempt made to produce this plan (observability).
+        std::vector<LlmCallInfo> llm_calls;
     };
 
     explicit TaskPlanner(std::shared_ptr<class LlmClient> llm);

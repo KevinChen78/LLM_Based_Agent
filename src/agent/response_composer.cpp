@@ -128,6 +128,7 @@ coro::Task<RecommendationResult> ResponseComposer::Compose(
     // even though there are no deals to recommend.
     if (items.empty() && grounding.empty()) {
         result.response_text = "抱歉，暂时没有符合条件的团购。您可以换个城市或预算试试。";
+        result.compose_mode = "short_circuit";
         if (emitter) StreamText(*emitter, result.response_text);
         co_return result;
     }
@@ -157,10 +158,21 @@ coro::Task<RecommendationResult> ResponseComposer::Compose(
                 auto sr = co_await llm_->ChatStream(
                     messages, options,
                     [&emitter](const std::string& d) { emitter->EmitDelta(d); });
+                // Streaming carries latency but no token usage (upstream does
+                // not send it); tokens stay 0 — recorded honestly.
+                LlmCallInfo info;
+                info.purpose = "compose";
+                info.model = options.model;
+                info.latency = sr.latency;
                 if (sr.streamed && !sr.text.empty()) {
+                    info.status = "success";
+                    result.llm_calls.push_back(std::move(info));
+                    result.compose_mode = "llm_stream";
                     result.response_text = std::move(sr.text);
                     co_return result;
                 }
+                info.status = "stream_fallback";
+                result.llm_calls.push_back(std::move(info));
                 spdlog::warn("ResponseComposer: streaming unavailable, emitting template as deltas.");
             } catch (const std::exception& e) {
                 spdlog::warn("ResponseComposer: stream failed ({}), using template.", e.what());
@@ -169,6 +181,7 @@ coro::Task<RecommendationResult> ResponseComposer::Compose(
         // Streaming fallback: emit the deterministic template as deltas.
         std::string t = BuildTemplateReply(items);
         StreamText(*emitter, t);
+        result.compose_mode = "template";
         result.response_text = std::move(t);
         co_return result;
     }
@@ -188,11 +201,22 @@ coro::Task<RecommendationResult> ResponseComposer::Compose(
             options.max_tokens = 2048;   // see streaming path note
             auto resp = co_await llm_->Chat(messages, options);
 
+            LlmCallInfo info;
+            info.purpose = "compose";
+            info.model = resp.model.empty() ? options.model : resp.model;
+            info.prompt_tokens = resp.prompt_tokens;
+            info.completion_tokens = resp.completion_tokens;
+            info.latency = resp.latency;
             auto reply = TryParseComposition(resp.raw_text, result.items);
             if (reply && !reply->empty()) {
+                info.status = "success";
+                result.llm_calls.push_back(std::move(info));
+                result.compose_mode = "llm";
                 result.response_text = std::move(*reply);
                 co_return result;
             }
+            info.status = "template_fallback";
+            result.llm_calls.push_back(std::move(info));
             spdlog::warn("ResponseComposer: LLM reply unparseable, using template.");
         } catch (const std::exception& e) {
             spdlog::warn("ResponseComposer: LLM composition failed ({}), using template.", e.what());
@@ -200,6 +224,7 @@ coro::Task<RecommendationResult> ResponseComposer::Compose(
     }
 
     // Fallback: deterministic templated reply.
+    result.compose_mode = "template";
     result.response_text = BuildTemplateReply(items);
     co_return result;
 }

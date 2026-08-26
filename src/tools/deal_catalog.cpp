@@ -2,21 +2,102 @@
 
 #include <spdlog/spdlog.h>
 
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 
+#ifdef AGENT_HAVE_LIBPQ
+#include <libpq-fe.h>
+#endif
+
 namespace agent {
 
-DealCatalog::DealCatalog(const std::string& json_path) {
-    LoadFromFile(json_path);
+DealCatalog::DealCatalog(const std::string& json_path, const std::string& pg_dsn) {
+    if (!pg_dsn.empty()) {
+        if (LoadFromPostgres(pg_dsn)) {
+            source_ = "postgres";
+        } else {
+            spdlog::warn("DealCatalog: PostgreSQL load failed; falling back to file '{}'",
+                         json_path.empty() ? "<empty>" : json_path);
+        }
+    }
+    if (!loaded_) {
+        LoadFromFile(json_path);
+        if (loaded_) source_ = "file:" + json_path;
+    }
     if (!loaded_) {
         spdlog::warn("DealCatalog: falling back to built-in dataset (path='{}' not usable)",
                      json_path.empty() ? "<empty>" : json_path);
         deals_ = BuiltInFallback();
         loaded_ = true;
+        source_ = "builtin";
     }
-    spdlog::info("DealCatalog: loaded {} deals (source={})",
-                 Size(), loaded_ ? (deals_.empty() ? "empty" : "ok") : "fallback");
+    spdlog::info("DealCatalog: loaded {} deals (source={})", Size(), source_);
+}
+
+bool DealCatalog::LoadFromPostgres(const std::string& dsn) {
+#ifdef AGENT_HAVE_LIBPQ
+    PGconn* conn = PQconnectdb(dsn.c_str());
+    if (PQstatus(conn) != CONNECTION_OK) {
+        spdlog::warn("DealCatalog: PQconnectdb failed: {}", PQerrorMessage(conn));
+        PQfinish(conn);
+        return false;
+    }
+    // Same 14 columns + ORDER BY item_id as the Python service's pg_load_deals,
+    // so both control planes see identical rows in identical order.
+    PGresult* res = PQexec(conn,
+        "SELECT item_id, merchant_id, title, category, city, district,"
+        " price, original_price, sold_count, rating,"
+        " min_people, max_people, tags, description"
+        " FROM groupbuy_items ORDER BY item_id");
+    bool ok = false;
+    if (PQresultStatus(res) == PGRES_TUPLES_OK) {
+        nlohmann::json arr = nlohmann::json::array();
+        const int n = PQntuples(res);
+        for (int i = 0; i < n; ++i) {
+            auto text = [&](int col) { return PQgetvalue(res, i, col); };
+            nlohmann::json d;
+            d["item_id"] = text(0);
+            d["merchant_id"] = text(1);
+            d["title"] = text(2);
+            d["category"] = text(3);
+            d["city"] = text(4);
+            d["district"] = PQgetisnull(res, i, 5) ? nlohmann::json(nullptr)
+                                                   : nlohmann::json(text(5));
+            d["price"] = std::strtod(text(6), nullptr);
+            d["original_price"] = PQgetisnull(res, i, 7)
+                    ? nlohmann::json(nullptr)
+                    : nlohmann::json(std::strtod(text(7), nullptr));
+            d["sold_count"] = std::strtoll(text(8), nullptr, 10);
+            d["rating"] = std::strtod(text(9), nullptr);
+            d["min_people"] = std::strtoll(text(10), nullptr, 10);
+            d["max_people"] = std::strtoll(text(11), nullptr, 10);
+            d["tags"] = nlohmann::json::parse(text(12), nullptr, /*allow_exceptions=*/false);
+            if (d["tags"].is_discarded()) d["tags"] = nlohmann::json::array();
+            d["description"] = text(13);
+            arr.push_back(std::move(d));
+        }
+        // An empty table is more likely a seeding mistake than a real catalog —
+        // fall through to the JSON file instead of serving nothing.
+        if (!arr.empty()) {
+            deals_ = std::move(arr);
+            loaded_ = true;
+            ok = true;
+        } else {
+            spdlog::warn("DealCatalog: groupbuy_items is empty; treating as failure");
+        }
+    } else {
+        spdlog::warn("DealCatalog: PG query failed: {}", PQerrorMessage(conn));
+    }
+    PQclear(res);
+    PQfinish(conn);
+    return ok;
+#else
+    (void)dsn;
+    spdlog::warn("DealCatalog: built without libpq (ENABLE_PG_CATALOG=OFF or PG not"
+                 " found); ignoring PG_DSN");
+    return false;
+#endif
 }
 
 void DealCatalog::LoadFromFile(const std::string& path) {

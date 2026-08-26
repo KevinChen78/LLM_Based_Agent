@@ -13,11 +13,13 @@ LLM_Based_Agent/
 │   ├── tools/           # Mock 工具
 │   └── memory/          # 会话记忆
 ├── llm_gateway/         # Python Mock LLM Gateway
-├── retrieval_service/   # Python BM25 检索服务（商品语义召回 + 知识库 RAG）
+├── retrieval_service/   # Python 检索服务（PostgreSQL 存储 + SQL 过滤下推 + BM25 排序）
+├── sql/                 # PostgreSQL DDL 与初始化走查
 ├── tests/               # 单元测试
 ├── proto/               # gRPC/Protobuf 定义
 ├── configs/             # 配置文件
 ├── cmake/               # CMake 依赖管理
+├── requirements.txt     # Python 依赖（psycopg，仅检索服务 postgres 后端需要）
 └── docs/                # 构建指南
 ```
 
@@ -85,6 +87,17 @@ curl -s -X POST http://localhost:8080/v1/chat \
   -H "Content-Type: application/json" \
   --data-binary @scripts/test_chat.json
 ```
+
+多轮对话 e2e 回归（脚本自动起停 api_server，临时 SQLite 库，纯 stdlib）：
+
+```bash
+python scripts/e2e_multi_turn.py          # 离线确定性：内置 stub，34 项断言
+python scripts/e2e_multi_turn.py --real   # 真实 LLM：需 gateway 配好 LLM_API_KEY
+```
+
+覆盖：追问→补全→推荐多轮主链路、反馈落库（👍/👎 → feedback 表 + FK 拒绝）、
+SSE 事件序列、SQLite turns/context 直读校验、重启后同库续聊、会话内安全护栏、观测落库（7 请求 7 行审计 + metrics 聚合）；`--real` 额外验证语义级槽位延续（只补预算时
+不再追问城市/人数）与知识问题 kb_search grounding。
 
 ## 接入真实 LLM
 
@@ -197,11 +210,50 @@ $env:SESSION_STORE="memory"
 
 构造 `AgentOrchestrator` 时传 `SafetyGuard` 即启用，传 `nullptr` 则跳过（默认参数，不破坏现有调用）。规则集见 [include/agent/safety_guard.hpp](include/agent/safety_guard.hpp) 与 [src/agent/safety_guard.cpp](src/agent/safety_guard.cpp)；单测见 [tests/test_safety_guard.cpp](tests/test_safety_guard.cpp)。
 
+## 观测与评估（recommendation_logs / llm_calls / metrics / evaluate.py）
+
+每次请求落一行推荐审计、每次 LLM 调用落一行调用审计（独立库 `data/observability.db`，
+`OBS_DB_PATH` 可改），`trace_id` 串联两表：
+
+- `recommendation_logs`：trace_id / session_id / 请求文本 / action / 槽位 / Top5 商品+分数 /
+  回复 / grounding 数 / compose_mode（llm_stream·llm·template·short_circuit·none）/ 端到端延迟。
+- `llm_calls`：trace_id / purpose（plan·compose）/ model / prompt+completion tokens / 延迟 /
+  status / attempt（planner 重试序号）。**流式 compose 行 tokens 记 0**（上游未开
+  `stream_options.include_usage`，属口径而非丢失）。
+
+聚合指标：`GET /v1/metrics`（请求分布、FALLBACK 率、空推荐率、avg/p95 延迟、LLM 调用与
+token 汇总、ATTACH 会话库算反馈满意率）。
+
+离线评估报告：
+
+```bash
+python scripts/evaluate.py     # 读 data/observability.db + data/sessions.db
+```
+
+输出 action 分布、FALLBACK/空推荐率、追问后续答率、延迟 avg/p50/p95、LLM token 消耗、
+grounding 触发率、反馈满意率与被 👎 最多商品 Top5。实现见
+[include/agent/observability_store.hpp](include/agent/observability_store.hpp)；
+单测见 [tests/test_observability.cpp](tests/test_observability.cpp)。
+
+## 反馈落库（👍/👎 → feedback 表）
+
+每条助手回复底部和每张商品卡片上都有 👍/👎 按钮，点击后 POST `/v1/feedback`，
+写入会话库（`data/sessions.db`）的 `feedback` 表：
+
+```
+rowid | session_id(FK→sessions) | trace_id | item_id(空=整条回复) | feedback_type(like/dislike) | comment | created_at
+```
+
+- 请求体：`{session_id(必填), feedback_type("like"|"dislike"), trace_id?, item_id?, comment?}`；
+  成功 `{"success":true}`；未知 session（FK 拒绝）或非法 type → 400 `{"success":false,"error":...}`。
+- 存储接口：`SessionMemoryStore::AppendFeedback`（SQLite / InMemory 双实现，未知 session 语义一致）。
+- 前端：`web/app.js` 的 `sendFeedback()`，乐观置灰、失败恢复可点。
+
 ## 真实召回 / 排序后端
 
 默认后端是**真实目录驱动的召回 + 多因子排序**，替代了 Phase 0 的写死 Mock 数据：
 
-- `DealCatalog`（[include/agent/deal_catalog.hpp](include/agent/deal_catalog.hpp)）：从 `data/deals.json` 加载团购商品（20 条，覆盖 6 城 7 类目），文件缺失/不可读时自动回退到内置兜底数据集（8 条），保证离线和单测环境也能跑。
+- `DealCatalog`（[include/agent/deal_catalog.hpp](include/agent/deal_catalog.hpp)）：从 `data/deals.json` 加载团购商品（5320 条，覆盖 8 城——武汉 5000 条 + 深圳/北京/上海各 100 条生成数据，由 `scripts/gen_wuhan_deals.py` 与 `scripts/gen_city_deals.py` 确定性生成、幂等重跑），文件缺失/不可读时自动回退到内置兜底数据集（8 条），保证离线和单测环境也能跑。
 - `DealRetriever`（工具名 `deal_retriever`）：按 `city / category / district / max_price / min_price / people / keywords / top_k` 过滤，再按**相关性打分**（关键词命中 + 评分 + 折扣）排序并截断 `top_k`；`people` 会匹配套餐的 `min_people/max_people` 区间。
 - `DealRanker`（工具名 `deal_ranker`）：对召回候选做多因子重排 `0.35·评分 + 0.25·销量归一 + 0.25·价格契合 + 0.15·折扣`，可选 `taboo` 禁忌词过滤、`budget` 对超预算项大幅扣分，取 `top_n`。
 
@@ -312,25 +364,55 @@ data: {"event":"final","data":{"session_id":"...","reply":"...","items":[...]}}
 | 连接 | 请求-响应 | 长连接，流结束后关闭 |
 | 适用场景 | 简单集成 | 需要实时反馈 / 后续 token 流 |
 
-## RAG：BM25 商品语义召回 + 知识库问答
+## RAG：BM25 + 向量 RRF 商品语义召回 + 知识库问答
 
-在真实目录后端之上，可选地接入一个**纯 Python 标准库**的检索服务
+在真实目录后端之上，可选地接入一个检索服务
 （[retrieval_service/main.py](retrieval_service/main.py)，:8001），提供两层 RAG 能力：
 
-1. **商品语义召回**：`DealRetriever` 的文本相关性从子串匹配升级为 **BM25**
-   （中文按字符 bigram 分词，无需 jieba；英文按单词；k1=1.5，b=0.75），
-   同义词/口语表达召回率更高。结构化过滤（城市/类目/价格/人数）规则与 C++ 端一致，
-   先过滤再对存活集做 BM25；query 为空或无文本命中时回退到评分排序。
+1. **商品语义召回**：`DealRetriever` 的文本相关性从子串匹配升级为 **BM25
+   （k1=1.5，b=0.75，中文按字符 bigram 分词，无需 jieba）+ pgvector 向量召回的
+   RRF 融合**（k=60；向量由 fastembed + bge-small-zh-v1.5 生成，512 维，见下文
+   "向量召回"小节），同义词/口语表达（"情侣约会""吃点辣的"）召回率显著提升。
+   结构化过滤（城市/类目/价格/人数）规则与 C++ 端一致，先过滤再对存活集融合排序；
+   query 为空或过滤集为空时回退到评分排序。
 2. **知识库 RAG**：新增工具 `kb_search`（`KnowledgeRetriever`），检索
    [data/knowledge.json](data/knowledge.json)（22 条 FAQ/政策/菜品知识：
    发票/预约/退款/包间/停车/忌口/营业时间/核销等）。编排器把命中的段落收集为
    **grounding**，注入 composer 的 LLM prompt（`# 参考知识` 块），让事实性回答
    有据可依而非编造；`/v1/chat` 响应与流式 `final` 事件都会带上 `grounding` 字段。
 
+**存储后端**（`RETRIEVAL_BACKEND`，默认 `postgres`）：
+
+- `postgres`：商品/知识库存 PostgreSQL（`groupbuy_items`/`merchants`/`kb_passages`，
+  DDL 见 [sql/001_schema.sql](sql/001_schema.sql)，初始化走查见 [sql/README.md](sql/README.md)）。
+  **结构化过滤下推为索引 SQL**（city/category/district/价格/人数），BM25 排序仍在
+  Python——启动时从 PG 全量加载构建语料，排序行为与 JSON 后端逐字节一致
+  （`scripts/test_pg_retrieval.py` 双后端 20 例 diff 矩阵证明）。
+  依赖 psycopg + fastembed（`pip install -r requirements.txt`，项目仅有的两个
+  第三方 Python 依赖）；数据播种 `python scripts/pg_seed.py`（JSON 生成器仍是
+  数据源，幂等同步），向量生成 `python scripts/pg_embed.py`（增量补 NULL 行）。
+- `json`：原文件后端，纯 Python 标准库零依赖。postgres 后端启动失败（PG 未起/
+  未播种/缺 psycopg）时自动降级为该模式并打印 WARNING，`/v1/health` 的
+  `backend` 字段指示当前实际后端。
+
+**向量召回**（`RETRIEVAL_VECTOR`，默认 `on`，仅 postgres 后端生效）：
+fastembed（ONNX 运行时，无 torch）加载 bge-small-zh-v1.5，查询向量与商品向量在
+PG 内做余弦 ANN（pgvector `<=>` 算子 + HNSW 索引），向量候选与 BM25 候选按
+RRF 融合（k=60，分数归一化到 0..1）；缺模型/缺向量列/embedding 未生成时任一失败
+自动降级纯 BM25 并 WARNING，健康检查的 `vector`/`vector_model` 字段可观测。
+初始化与验证步骤见 [sql/README.md](sql/README.md) §6（含国内网络 HF 镜像配置）；
+语义断言与对比证明见 `scripts/test_pg_vector.py`。
+注意行为变化：向量通道开启后非空查询几乎总有结果（余弦最近邻永远存在），
+"无文本命中 → 评分排序兜底"只在结构化过滤集为空时触发。
+知识库 kb_passages 保持纯 BM25（22 条，无需向量）。
+
 ### 启用方式
 
 ```powershell
-# 1. 启动检索服务（:8001）
+# 0. 一次性：PostgreSQL 初始化（建库/建表/播种），见 sql/README.md
+pip install -r requirements.txt
+
+# 1. 启动检索服务（:8001，默认 backend=postgres）
 python retrieval_service/main.py
 
 # 2. 启动网关（:8000）与 api_server（:8080），并指向检索服务
@@ -346,7 +428,8 @@ $env:RETRIEVAL_SERVICE_URL="http://localhost:8001"
 ### 服务契约
 
 ```text
-GET  /v1/health          -> {"status":"ok","deal_count":120,"kb_count":22}
+GET  /v1/health          -> {"status":"ok","deal_count":5320,"kb_count":22,"backend":"postgres|json",
+                             "vector":"on|off","vector_model":"BAAI/bge-small-zh-v1.5"}
 POST /v1/retrieve/deals  body {"query","city","category","district","max_price","min_price","people","top_k"}
                      -> {"items":[<完整 deal>+score], "total":N}
 POST /v1/retrieve/kb     body {"query","top_k"}
@@ -367,13 +450,72 @@ cpp-httplib，非流式 POST）封装；`DealRetriever` 注入 client 后健康�
 
 ### 升级路径
 
-BM25 → embedding 时只需在 `retrieval_service` 内把 `BM25Index` 换成
-sentence-transformers（如 `paraphrase-multilingual-MiniLM-L12-v2`）+ 余弦检索，
-端点契约不变，C++ 侧零改动。
+语义召回升级（BM25 → BM25 + 向量 RRF）已完成（见上文"向量召回"小节，
+端点契约不变，C++ 侧零改动）。下一步可在 kb_passages 上引入向量召回，
+或在更大商品量级下评估 embedding 模型升级（bge-m3 等）。
 
 单测见 [tests/test_kb.cpp](tests/test_kb.cpp)（kb_search 契约/未配置/服务宕机、
 BM25 委托/回退/无 client 不回归）与 [tests/test_composer.cpp](tests/test_composer.cpp)
 （grounding 注入 prompt、空 items + 有 grounding 仍走 LLM 回答知识问题）。
+
+## 路线图：Phase 2 增量规划
+
+核心推荐闭环、反馈闭环、观测评估闭环均已闭合。以下是从"可演示 Agent"走向
+"生产级推荐系统"的增量项，按优先级排序（对应《项目规划_修订版.md》Phase 2）：
+
+### 2.1 学习式排序（反馈数据 → 排序优化）
+
+反馈表已开始积累 like/dislike 信号，这是排序学习的数据基础。
+
+- **特征存储**：`item_features` 表（CTR/CVR/7 日点击订单、类目热度），由
+  `feedback` + `recommendation_logs` 离线聚合生成（可先 SQL 脚本，后 Flink/Spark）。
+- **排序模型服务**：Python gRPC/HTTP 服务（LightGBM 起步），C++ 侧新增
+  `RankerClient` 替代/包裹现有规则排序 `DealRanker`，支持影子模式（模型分与
+  规则分同时记录，便于对比）。
+- **A/B 实验**：`ExperimentManager`（按 user_id 哈希分桶），实验组走模型分、
+  对照组走规则分，用 `feedback` 满意率与推荐日志点击率评估提升。
+- **成功标准**（修订版）：点击率/转化率优于规则基线 10%+。
+
+### 2.2 用户画像与长期记忆
+
+- `UserProfileStore`（常驻城市/类目偏好/价格敏感度/忌口标签）+
+  `PreferenceExtractor`：从历史会话与反馈中抽取偏好，planner prompt 注入
+  "用户画像"段，让"老用户少被追问、推荐更贴身"。
+- 会话记忆从 SQLite 迁 Redis（短期 TTL）+ PostgreSQL（持久化），支撑多实例部署。
+
+### 2.3 数据层升级 —— **已完成**
+
+- **商品库迁 PostgreSQL（检索路径）**：`groupbuy_items`/`merchants`/
+  `kb_passages` 三表（[sql/001_schema.sql](sql/001_schema.sql)），检索服务默认
+  `backend=postgres`，结构化过滤下推 SQL + BM25 排序留 Python；
+  `scripts/pg_seed.py` 幂等播种、`scripts/test_pg_retrieval.py` 双后端一致性矩阵。
+- **`DealCatalog` DB 后端**：C++ 侧经 libpq 直连 `groupbuy_items`
+  （`CATALOG_BACKEND=postgres` + `PG_DSN`，默认 json 保持离线确定性），
+  回退链 PG → JSON 文件 → 内置 8 条；CMake 自动探测 libpq 并暂存运行时 DLL。
+- **语义召回升级**：BM25 + pgvector 向量 **RRF 融合**（fastembed
+  bge-small-zh-v1.5 512 维，`sql/002_vector.sql` + `scripts/pg_embed.py` 离线生成，
+  查询时向量 ANN 与 BM25 各取候选池按倒数排名融合，同义词/口语查询召回显著提升；
+  `RETRIEVAL_VECTOR` 开关，缺模型/缺向量自动降级纯 BM25；
+  `scripts/test_pg_vector.py` 语义断言 + 对比证明）。
+- `sql/` 目录已有检索库 DDL；后续待办：sessions/feedback/observability 三库
+  从 SQLite 迁 PG 的正式 DDL 与迁移脚本。
+
+### 2.4 服务化与生产横切
+
+- **gRPC**：`proto/agent_service.proto` 已定义未接线；C++↔Python 服务间调用从
+  HTTP 迁 gRPC（性能与契约强度）。
+- **API 中间件**：鉴权（JWT）、限流（令牌桶）、Trace 注入（对接已有 trace_id）。
+- **外部工具**：`ExternalToolClient`（地图/营业时间/优惠券实时信息），扩展
+  planner 的工具集。
+- **管理后台**：`apps/admin_console`——配置热更（Prompt 版本/模型名/超参）、
+  日志查询（直接读 observability.db）、实验管理界面。
+- **SLO 落地**：p99 < 1.5s 目标接入 `/v1/metrics` 告警口径；LLM 多模型
+  `ModelFallbackManager`（主模型超时自动切备用模型，`LlmModelTier` 已预留）。
+
+### 明确不做（当前规模下）
+
+K8s/服务网格、ClickHouse 离线数仓、Prometheus 外部监控栈——单机 SQLite +
+`/v1/metrics` + `evaluate.py` 已覆盖当前体量的观测需求，待多实例部署时再引入。
 
 ## 相关文件
 
@@ -383,5 +525,3 @@ BM25 委托/回退/无 client 不回归）与 [tests/test_composer.cpp](tests/te
 - HTTP 入口：`apps/api_server/main.cpp` 的 `/v1/chat/stream` 路由
 - 底层 chunked 支持：`../coro/include/coro/net/http/response.hpp`、`../coro/include/coro/net/http/server.hpp`
 - 单测：`tests/test_streaming.cpp`
-#   L L M _ B a s e d _ A g e n t  
- 

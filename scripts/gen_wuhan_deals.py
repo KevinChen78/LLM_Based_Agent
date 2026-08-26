@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Append 100 deterministic Wuhan group-buying deals to data/deals.json.
+"""Append 5000 deterministic Wuhan group-buying deals to data/deals.json.
 
 Idempotent: re-running removes any previously generated Wuhan records and
 regenerates a fresh, stable set (so the file is reproducible). The original
 non-Wuhan records are always preserved.
+
+Diversity: titles are composed as "<landmark>·<dish>（<p> 人餐）" over
+20 dish templates x 24 landmarks x 8 party sizes = 3840 distinct combos
+(the remaining 1160 records repeat a combo once — realistic for chain
+stores). Each landmark maps to a consistent district. All variation is a
+pure function of the record index, so the output is byte-stable.
 
 Run from the project root:
     python scripts/gen_wuhan_deals.py
@@ -17,12 +23,23 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT = os.path.dirname(HERE)
 DATA_PATH = os.path.join(PROJECT, "data", "deals.json")
 
-NUM = 100
+NUM = 5000
 CITY = "武汉"
 
-DISTRICTS = [
-    "武昌", "江汉", "江岸", "汉阳", "洪山", "光谷",
-    "青山", "硚口", "江夏", "蔡甸", "东西湖", "黄陂",
+# (landmark, district) — landmark goes into the title, district is consistent.
+LANDMARKS = [
+    ("黄鹤楼", "武昌"), ("司门口", "武昌"),
+    ("江汉路", "江汉"), ("武广", "江汉"),
+    ("武汉天地", "江岸"), ("后湖", "江岸"),
+    ("王家湾", "汉阳"), ("钟家村", "汉阳"),
+    ("街道口", "洪山"), ("南湖", "洪山"),
+    ("光谷步行街", "光谷"), ("关山大道", "光谷"),
+    ("红钢城", "青山"), ("建二", "青山"),
+    ("汉正街", "硚口"), ("古田", "硚口"),
+    ("纸坊", "江夏"), ("藏龙岛", "江夏"),
+    ("后官湖", "蔡甸"), ("蔡甸广场", "蔡甸"),
+    ("吴家山", "东西湖"), ("金银湖", "东西湖"),
+    ("盘龙城", "黄陂"), ("前川", "黄陂"),
 ]
 
 # (category, title template, tags, base_price, base_min_people, base_max_people, description)
@@ -49,6 +66,8 @@ TEMPLATES = [
     ("粤菜", "粤式茶餐厅（{p} 人餐）", ["虾饺", "粤菜"], 198, 2, 4, "经典粤式点心拼盘，老少皆宜"),
 ]
 
+PARTY_SIZES = [2, 3, 4, 5, 6, 8, 10, 12]
+
 
 def gen():
     with open(DATA_PATH, "r", encoding="utf-8") as f:
@@ -57,12 +76,18 @@ def gen():
     # Drop any existing Wuhan records so regeneration is stable.
     deals = [d for d in deals if d.get("city") != CITY]
 
+    n_tpl = len(TEMPLATES)
+    n_lm = len(LANDMARKS)
     for i in range(NUM):
-        cat, title_tpl, tags, base_price, bmin, bmax, desc = TEMPLATES[i % len(TEMPLATES)]
-        # People: cycle a small set for variety in the title and serving range.
-        p = [2, 3, 4, 5, 6, 3, 4, 2][i % 8]
+        # Independent cycle lengths keep the three dimensions orthogonal:
+        # template changes every record, landmark every 20, party size every 480.
+        cat, title_tpl, tags, base_price, bmin, bmax, desc = TEMPLATES[i % n_tpl]
+        landmark, district = LANDMARKS[(i // n_tpl) % n_lm]
+        p = PARTY_SIZES[(i // (n_tpl * n_lm)) % len(PARTY_SIZES)]
         title = title_tpl.format(p=p) if "{p}" in title_tpl else title_tpl
-        price = round(base_price + (i % 7) * 12 - (i % 3) * 6, 0)
+        title = "{0}·{1}".format(landmark, title)
+        price = round(base_price + (i % 7) * 12 - (i % 3) * 6
+                      + ((i // n_tpl) % n_lm) % 5 * 10, 0)
         if price < 30:
             price = 30
         original = round(price * (1.5 + (i % 5) * 0.08), 0)
@@ -70,7 +95,6 @@ def gen():
         rating = round(4.1 + (i % 9) * 0.1, 1)
         if rating > 4.9:
             rating = 4.9
-        district = DISTRICTS[(i * 5) % len(DISTRICTS)]
         # Scale the serving range around the title's people count.
         min_p = max(1, bmin + (p - 3))
         max_p = bmax + (p - 3)
@@ -105,5 +129,6 @@ def gen():
 if __name__ == "__main__":
     total = gen()
     sys.stdout.buffer.write(
-        ("Wuhan deals generated. Total deals now: {0}\n".format(total)).encode("utf-8")
+        ("Wuhan deals generated ({0}). Total deals now: {1}\n"
+         .format(NUM, total)).encode("utf-8")
     )

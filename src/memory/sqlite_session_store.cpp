@@ -104,6 +104,19 @@ void SqliteSessionStore::InitSchema() {
         );
     )");
     exec("CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, rowid);");
+    exec(R"(
+        CREATE TABLE IF NOT EXISTS feedback (
+            rowid         INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id    TEXT NOT NULL,
+            trace_id      TEXT,
+            item_id       TEXT,
+            feedback_type TEXT NOT NULL,
+            comment       TEXT,
+            created_at    TEXT,
+            FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+        );
+    )");
+    exec("CREATE INDEX IF NOT EXISTS idx_feedback_session ON feedback(session_id, rowid);");
 }
 
 coro::Task<SessionMemoryStore::Session> SqliteSessionStore::GetOrCreateSession(
@@ -182,6 +195,30 @@ coro::Task<Status> SqliteSessionStore::AppendTurn(
     if (sqlite3_step(raw) != SQLITE_DONE) {
         // FK violation => unknown session, or other error.
         co_return Status::Error(1, std::string("append turn failed: ") + sqlite3_errmsg(db_));
+    }
+    co_return Status::OK();
+}
+
+coro::Task<Status> SqliteSessionStore::AppendFeedback(const FeedbackRecord& rec) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sqlite3_stmt* raw = nullptr;
+    if (sqlite3_prepare_v2(db_,
+            "INSERT INTO feedback (session_id, trace_id, item_id, feedback_type, comment, created_at) "
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            -1, &raw, nullptr) != SQLITE_OK) {
+        co_return Status::Error(1, std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    }
+    StmtGuard g(raw);
+    sqlite3_bind_text(raw, 1, rec.session_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(raw, 2, rec.trace_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(raw, 3, rec.item_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(raw, 4, rec.feedback_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(raw, 5, rec.comment.c_str(), -1, SQLITE_TRANSIENT);
+    const std::string now = NowIso8601();
+    sqlite3_bind_text(raw, 6, now.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(raw) != SQLITE_DONE) {
+        // FK violation => unknown session, or other error.
+        co_return Status::Error(1, std::string("append feedback failed: ") + sqlite3_errmsg(db_));
     }
     co_return Status::OK();
 }

@@ -214,9 +214,58 @@
 
       if (it.reason) card.appendChild(el('div', 'card-reason', it.reason));
 
+      card.appendChild(feedbackButtons(it.item_id || ''));
+
       wrap.appendChild(card);
     });
     handle.bubble.appendChild(wrap);
+    scrollToBottom();
+  }
+
+  // ---- 反馈（👍/👎 → /v1/feedback 落库） ----
+  function sendFeedback(itemId, type, wrap, doneLabel) {
+    if (!state.sessionId) return;
+    var body = JSON.stringify({
+      user_id: state.userId,
+      session_id: state.sessionId,
+      trace_id: state.lastTraceId || '',
+      item_id: itemId,
+      feedback_type: type
+    });
+    // 乐观置灰；失败则恢复可点
+    Array.prototype.forEach.call(wrap.querySelectorAll('button'), function (b) {
+      b.disabled = true;
+    });
+    fetch('/v1/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: body
+    }).then(function (resp) {
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      wrap.textContent = doneLabel;
+      wrap.classList.add('feedback-done');
+    }).catch(function () {
+      Array.prototype.forEach.call(wrap.querySelectorAll('button'), function (b) {
+        b.disabled = false;
+      });
+    });
+  }
+
+  function feedbackButtons(itemId) {
+    var wrap = el('div', itemId ? 'card-feedback' : 'feedback-bar');
+    var up = el('button', 'feedback-btn', '👍');
+    var down = el('button', 'feedback-btn', '👎');
+    up.title = '有帮助';
+    down.title = '不太好';
+    up.addEventListener('click', function () { sendFeedback(itemId, 'like', wrap, '已收到反馈，谢谢！'); });
+    down.addEventListener('click', function () { sendFeedback(itemId, 'dislike', wrap, '已收到反馈，我们会改进'); });
+    wrap.appendChild(up);
+    wrap.appendChild(down);
+    return wrap;
+  }
+
+  function renderFeedbackBar(handle) {
+    handle.bubble.appendChild(feedbackButtons(''));
     scrollToBottom();
   }
 
@@ -379,6 +428,7 @@
       if (!handle.text) renderSystemNote('⚠️ ' + ctx.error, true);
     } else if (ctx.final) {
       var f = ctx.final;
+      state.lastTraceId = f.trace_id || '';
       finalizeText(handle, f.reply || '');
       if (!handle.text && !f.is_clarifying) {
         handle.content.textContent = '（没有收到回复）';
@@ -386,6 +436,7 @@
       renderDealCards(handle, f.items);
       renderGrounding(handle, f.grounding);
       if (f.is_clarifying) renderClarifyChips(handle, ctx.missingSlots);
+      renderFeedbackBar(handle);
     } else if (!handle.text) {
       renderSystemNote('⚠️ 未收到有效响应', true);
     }

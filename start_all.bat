@@ -9,8 +9,13 @@ rem ============================================================
 setlocal
 cd /d "%~dp0"
 
-rem api_server picks this up via environment (inherited by start)
+rem api_server picks these up via environment (inherited by start)
 set RETRIEVAL_SERVICE_URL=http://localhost:8001
+
+rem Catalog: load deals from PostgreSQL (falls back to data/deals.json if PG
+rem is unreachable). Fill in the password from retrieval_service/.env.local.
+set CATALOG_BACKEND=postgres
+set PG_DSN=host=127.0.0.1 port=5432 dbname=groupbuy user=agent password=agent_dev_2026
 
 echo [1/3] Starting retrieval_service on :8001 ...
 start "retrieval_service :8001" python retrieval_service/main.py

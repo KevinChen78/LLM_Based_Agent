@@ -83,6 +83,23 @@ TEST(TaskPlanner, EnoughSlotsTriggersRetrieve) {
     EXPECT_EQ(plan.tool_calls[0].tool_name, "deal_retriever");
 }
 
+TEST(TaskPlanner, ChitchatTriggersRespondWithDirectResponse) {
+    auto llm = std::make_shared<HttpLlmClient>("", "");
+    TaskPlanner planner(llm);
+
+    UserContext ctx;
+    ctx.user_id = "u1";
+
+    std::vector<ConversationTurn> history;
+    nlohmann::json current_slots = nlohmann::json::object();
+
+    auto plan = planner.PlanNextStep(ctx, history, "谢谢", current_slots).result();
+
+    EXPECT_EQ(plan.next_state, "respond");
+    EXPECT_TRUE(plan.tool_calls.empty());
+    EXPECT_FALSE(plan.direct_response.empty());
+}
+
 // ---------------------------------------------------------------------------
 // Dirty-JSON tolerance (the P0 fix: fenced/prose-wrapped plans must parse,
 // garbage gets one temperature-0 retry before FALLBACK)

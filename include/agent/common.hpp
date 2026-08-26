@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <optional>
+#include <chrono>
 
 namespace agent {
 
@@ -50,6 +51,19 @@ struct RecommendationItem {
     std::string reason;
 };
 
+// Metadata for one LLM call, returned by planner/composer so the orchestrator
+// can persist an audit row (llm_calls) keyed by trace_id. Streaming calls have
+// no token usage (upstream does not send it) — tokens stay 0, which is honest.
+struct LlmCallInfo {
+    std::string purpose;          // plan / compose
+    std::string model;
+    std::string status;           // success / parse_error / template_fallback / stream_fallback
+    int prompt_tokens = 0;
+    int completion_tokens = 0;
+    int attempt = 0;              // planner retry index (0 = first)
+    std::chrono::milliseconds latency{0};
+};
+
 struct RecommendationResult {
     std::string session_id;
     std::string trace_id;
@@ -61,6 +75,11 @@ struct RecommendationResult {
     // readable snippets ("【title】content（来源：source）"). Empty when no RAG
     // retrieval ran, so non-RAG responses are unchanged.
     std::vector<std::string> grounding;
+    // --- observability (never serialized to clients) ---
+    // How the reply was produced: llm_stream / llm / template / short_circuit.
+    std::string compose_mode;
+    // LLM calls made while composing (planner calls are carried on Plan).
+    std::vector<LlmCallInfo> llm_calls;
 };
 
 struct ToolCall {
