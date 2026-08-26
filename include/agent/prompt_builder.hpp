@@ -12,7 +12,8 @@ public:
     static std::string TaskPlanningPrompt(
         const std::string& history,
         const std::string& user_message,
-        const std::string& current_slots_json);
+        const std::string& current_slots_json,
+        const std::string& user_profile_json = "");
 
     static std::string ResponseCompositionPrompt(
         const std::string& user_request,

@@ -14,12 +14,24 @@ std::string GroundingSection(const std::string& grounding) {
 )" + grounding + "\n";
 }
 
+// Build the "# 用户画像" block injected into the planning prompt when a
+// cross-session profile exists for this user (Phase 2.2). Returns an empty
+// string when there is no profile so the prompt is byte-identical to before.
+std::string UserProfileSection(const std::string& user_profile_json) {
+    if (user_profile_json.empty() || user_profile_json == "{}") return "";
+    return R"(
+# 用户画像（该用户的历史偏好统计，可用于预填 city/category/budget 以减少追问；
+# 仅供参考：用户当轮显式输入的槽位值永远优先于画像，画像与当轮输入冲突时以当轮为准）
+)" + user_profile_json + "\n";
+}
+
 } // namespace
 
 std::string PromptBuilder::TaskPlanningPrompt(
     const std::string& history,
     const std::string& user_message,
-    const std::string& current_slots_json) {
+    const std::string& current_slots_json,
+    const std::string& user_profile_json) {
     return R"(# Role
 你是“团购推荐 Agent”的任务规划器。你的职责是：
 1. 理解用户当前输入；
@@ -104,7 +116,7 @@ tool_calls 必须先包含召回调用：
 )" + history + R"(
 
 # 用户当前输入
-)" + user_message + R"(
+)" + user_message + UserProfileSection(user_profile_json) + R"(
 
 # 当前已填充槽位
 )" + current_slots_json + R"(

@@ -33,7 +33,10 @@ public:
         const UserContext& ctx,
         const std::vector<ConversationTurn>& history,
         const std::string& user_message,
-        const nlohmann::json& current_slots);
+        const nlohmann::json& current_slots,
+        // Cross-session user profile (Phase 2.2); empty object => the prompt
+        // carries no profile section and behaviour is unchanged.
+        const nlohmann::json& user_profile = nlohmann::json::object());
 
 private:
     std::shared_ptr<LlmClient> llm_;
