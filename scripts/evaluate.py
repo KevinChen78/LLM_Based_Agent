@@ -137,6 +137,79 @@ def main():
     else:
         print(f"\n(未找到 sessions 库 {args.sessions}，跳过追问有效性/反馈段)")
 
+    # ---- 排序 / A/B 实验对比（Phase 2.1；旧库无这些列则整段跳过）----
+    cols = {r["name"] for r in q("PRAGMA table_info(recommendation_logs)")}
+    if {"candidates_json", "experiment_group", "rank_mode"} <= cols:
+        print("\n■ 排序 / 实验对比（Phase 2.1）")
+        modes = q("SELECT COALESCE(NULLIF(rank_mode,''),'(none)') m, COUNT(*) c "
+                  "FROM recommendation_logs GROUP BY m ORDER BY c DESC")
+        print("  rank_mode 分布: " + (", ".join(f"{r['m']}={r['c']}" for r in modes)
+                                     if modes else "(无数据)"))
+        n_fallback = sum(r["c"] for r in modes if r["m"] == "rule_fallback")
+        n_ranked = sum(r["c"] for r in modes if r["m"] != "(none)")
+        if n_ranked:
+            print(f"  模型回退率 (rule_fallback): {pct(n_fallback, n_ranked)}"
+                  + ("  ⚠ 偏高,检查 ranking_service" if n_fallback > 0 else ""))
+
+        # Per-group satisfaction: feedback joined back by trace_id.
+        if has_sessions:
+            grp = q("SELECT rl.experiment_group g, f.feedback_type t, COUNT(*) c "
+                    "FROM sessions_db.feedback f "
+                    "JOIN recommendation_logs rl ON rl.trace_id = f.trace_id "
+                    "WHERE rl.experiment_group IS NOT NULL AND rl.experiment_group != '' "
+                    "GROUP BY g, t")
+            by_group = {}
+            for r in grp:
+                by_group.setdefault(r["g"], {"like": 0, "dislike": 0})
+                by_group[r["g"]][r["t"]] = r["c"]
+            if by_group:
+                print("  分组满意率 (feedback 按 trace_id 回连):")
+                for g in sorted(by_group):
+                    lk, dl = by_group[g]["like"], by_group[g]["dislike"]
+                    note = "" if lk + dl >= 30 else "  (样本<30,仅供参考)"
+                    print(f"    {g:<10} 👍{lk:>4} 👎{dl:>4} 满意率 "
+                          f"{pct(lk, lk + dl)}{note}")
+            else:
+                print("  分组满意率: 暂无带实验分组的反馈")
+
+            # Position sensitivity: like rate by position in ranked_items.
+            pos_rows = q(
+                "SELECT je.key AS pos, f.feedback_type AS t, COUNT(*) AS c "
+                "FROM sessions_db.feedback f "
+                "JOIN recommendation_logs rl ON rl.trace_id = f.trace_id, "
+                "  json_each(rl.ranked_items) je "
+                "WHERE f.item_id != '' AND json_extract(je.value, '$.item_id') = f.item_id "
+                "GROUP BY pos, t ORDER BY CAST(pos AS INTEGER)")
+            by_pos = {}
+            for r in pos_rows:
+                by_pos.setdefault(r["pos"], {"like": 0, "dislike": 0})
+                by_pos[r["pos"]][r["t"]] = r["c"]
+            if by_pos:
+                print("  位置敏感度 (该位置的反馈中 like 占比):")
+                for pos in sorted(by_pos, key=lambda p: int(p)):
+                    lk, dl = by_pos[pos]["like"], by_pos[pos]["dislike"]
+                    print(f"    第 {int(pos) + 1} 位: 👍{lk} 👎{dl} "
+                          f"({pct(lk, lk + dl)})")
+
+        # Candidate-set health: average candidates per ranked request.
+        cand = q("SELECT candidates_json FROM recommendation_logs "
+                 "WHERE candidates_json IS NOT NULL AND candidates_json != ''")
+        if cand:
+            import json as _json
+            counts = []
+            with_model = 0
+            for r in cand:
+                try:
+                    arr = _json.loads(r["candidates_json"])
+                    counts.append(len(arr))
+                    if any(c.get("model_score") is not None for c in arr):
+                        with_model += 1
+                except (ValueError, AttributeError):
+                    continue
+            if counts:
+                print(f"  候选集: avg {sum(counts)/len(counts):.1f} 条/请求, "
+                      f"含模型分 {pct(with_model, len(counts))}")
+
     con.close()
     print("\n" + "=" * 60)
     return 0

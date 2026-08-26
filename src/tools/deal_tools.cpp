@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <sstream>
+#include <unordered_map>
 
 namespace agent {
 
@@ -84,6 +85,24 @@ std::pair<int, int> KeywordMatch(const nlohmann::json& deal,
         if (hay.find(tk) != std::string::npos) ++matched;
     }
     return {matched, static_cast<int>(tokens.size())};
+}
+
+// The rule ranking formula (single source shared by serving, shadow audit,
+// and the training feature rank_in_rules — mirrored in
+// ranking_service/features.py:rule_score).
+double RuleScore(const nlohmann::json& deal, double budget, double max_sold) {
+    double rating_norm = deal.value("rating", 0.0) / 5.0;
+    double popularity = max_sold > 0.0
+        ? static_cast<double>(deal.value("sold_count", 0L)) / max_sold : 0.0;
+    double price = deal.value("price", 0.0);
+    double price_fit = 1.0;
+    if (budget > 0.0) {
+        price_fit = (price <= budget)
+            ? 1.0
+            : std::max(0.0, 1.0 - (price - budget) / budget);
+    }
+    return 0.35 * rating_norm + 0.25 * popularity + 0.25 * price_fit
+         + 0.15 * DiscountOf(deal);
 }
 
 } // namespace
@@ -242,6 +261,11 @@ coro::Task<ToolResult> DealRetriever::Execute(const ToolCall& call) {
 // DealRanker
 // ---------------------------------------------------------------------------
 
+DealRanker::DealRanker(std::shared_ptr<RankerClient> ranker,
+                       ExperimentManager experiment)
+    : ranker_(std::move(ranker))
+    , experiment_(std::move(experiment)) {}
+
 std::string DealRanker::SchemaJson() const {
     return R"({
         "name": "deal_ranker",
@@ -272,8 +296,15 @@ coro::Task<ToolResult> DealRanker::Execute(const ToolCall& call) {
         if (top_n <= 0) top_n = 3;
         std::string taboo = args.value("taboo", "");
         auto taboo_tokens = Tokenize(taboo);
+        // Injected by the orchestrator (not part of the LLM-visible schema):
+        // user_id drives experiment bucketing; city/category feed the model's
+        // context-cross features.
+        const std::string user_id = args.value("user_id", "");
+        const std::string ctx_city = args.value("city", "");
+        const std::string ctx_category = args.value("category", "");
 
-        // Optional taboo filtering.
+        // Optional taboo filtering. Always local, always before any model
+        // call — safety semantics are never delegated to the ranker service.
         nlohmann::json filtered = nlohmann::json::array();
         for (const auto& c : candidates) {
             if (!taboo_tokens.empty()) {
@@ -284,52 +315,131 @@ coro::Task<ToolResult> DealRanker::Execute(const ToolCall& call) {
         }
 
         // Popularity normalization denominator.
-        long max_sold = 1;
+        double max_sold = 1.0;
         for (const auto& c : filtered) {
-            long s = c.value("sold_count", 0L);
+            double s = static_cast<double>(c.value("sold_count", 0L));
             if (s > max_sold) max_sold = s;
         }
 
-        struct Scored { nlohmann::json deal; double score; };
+        // Rule scores are ALWAYS computed: they are the fallback on any
+        // ranker-service failure and are audited next to the model scores.
+        struct Scored {
+            nlohmann::json deal;
+            double rule_score;
+            double model_score = 0.0;
+            bool has_model_score = false;
+        };
         std::vector<Scored> scored;
+        scored.reserve(filtered.size());
         for (const auto& c : filtered) {
-            double rating_norm = c.value("rating", 0.0) / 5.0;
-            double popularity = static_cast<double>(c.value("sold_count", 0L)) / max_sold;
-            double price = c.value("price", 0.0);
-            double price_fit = 1.0;
-            if (budget > 0.0) {
-                price_fit = (price <= budget)
-                    ? 1.0
-                    : std::max(0.0, 1.0 - (price - budget) / budget);
-            }
-            double discount = DiscountOf(c);
-            double score = 0.35 * rating_norm
-                         + 0.25 * popularity
-                         + 0.25 * price_fit
-                         + 0.15 * discount;
-            scored.push_back({c, score});
+            scored.push_back({c, RuleScore(c, budget, max_sold), 0.0, false});
         }
 
-        std::sort(scored.begin(), scored.end(),
-                  [](const Scored& a, const Scored& b) { return a.score > b.score; });
+        // Experiment decision (off mode => no service call at all).
+        const bool use_model = ranker_ && ranker_->Enabled() &&
+                               experiment_.UseModel(user_id);
+        const bool want_shadow = ranker_ && ranker_->Enabled() &&
+                                 experiment_.WantShadowScore(user_id);
+        std::string rank_mode = "rule";
+        std::string model_version;
+        bool model_served = false;
+
+        if ((use_model || want_shadow) && !filtered.empty()) {
+            constexpr size_t kMaxModelCandidates = 50;  // bound the POST body
+            nlohmann::json model_candidates = nlohmann::json::array();
+            for (size_t i = 0; i < filtered.size() && i < kMaxModelCandidates; ++i) {
+                model_candidates.push_back(filtered[i]);
+            }
+            nlohmann::json req = {
+                {"candidates", model_candidates},
+                {"context", {{"budget", budget},
+                             {"people", args.value("people", 0)},
+                             {"city", ctx_city},
+                             {"category", ctx_category},
+                             {"user_id", user_id}}},
+                {"top_n", top_n},
+                {"shadow", !use_model},
+            };
+            auto resp = ranker_->Rank(req);
+            if (resp && resp->value("model_loaded", false) &&
+                resp->contains("items") && (*resp)["items"].is_array() &&
+                !(*resp)["items"].empty()) {
+                model_version = resp->value("model_version", "");
+                std::unordered_map<std::string, double> by_id;
+                for (const auto& it : (*resp)["items"]) {
+                    by_id[it.value("item_id", "")] = it.value("model_score", 0.0);
+                }
+                for (auto& s : scored) {
+                    auto it = by_id.find(s.deal.value("item_id", ""));
+                    if (it != by_id.end()) {
+                        s.model_score = it->second;
+                        s.has_model_score = true;
+                    }
+                }
+                model_served = use_model;
+            }
+            if (use_model && !model_served) {
+                rank_mode = "rule_fallback";
+                spdlog::warn("deal_ranker: model path failed, serving rule scores");
+            }
+        }
+        if (model_served) rank_mode = "model";
+
+        if (model_served) {
+            std::stable_sort(scored.begin(), scored.end(),
+                [](const Scored& a, const Scored& b) {
+                    if (a.has_model_score != b.has_model_score) return a.has_model_score;
+                    if (a.model_score != b.model_score) return a.model_score > b.model_score;
+                    return a.rule_score > b.rule_score;
+                });
+        } else {
+            std::stable_sort(scored.begin(), scored.end(),
+                [](const Scored& a, const Scored& b) { return a.rule_score > b.rule_score; });
+        }
 
         nlohmann::json out_items = nlohmann::json::array();
         for (size_t i = 0; i < scored.size() && static_cast<int>(i) < top_n; ++i) {
             nlohmann::json item = scored[i].deal;
-            item["score"] = scored[i].score;
+            // The served score: model score on the model path, rule score
+            // otherwise (keeps downstream compose / ranked_items consistent).
+            item["score"] = model_served && scored[i].has_model_score
+                ? scored[i].model_score : scored[i].rule_score;
             if (!item.contains("reason") || item["reason"].get<std::string>().empty()) {
                 item["reason"] = BuildReason(scored[i].deal);
             }
             out_items.push_back(item);
         }
 
+        // Audit block persisted to recommendation_logs by the orchestrator.
+        constexpr size_t kMaxAuditCandidates = 50;
+        nlohmann::json audit_candidates = nlohmann::json::array();
+        for (size_t i = 0; i < scored.size() && i < kMaxAuditCandidates; ++i) {
+            nlohmann::json c = {{"item_id", scored[i].deal.value("item_id", "")},
+                                {"rule_score", scored[i].rule_score}};
+            if (scored[i].has_model_score) c["model_score"] = scored[i].model_score;
+            else c["model_score"] = nullptr;
+            audit_candidates.push_back(c);
+        }
+        nlohmann::json rank_audit = {
+            {"experiment", experiment_.ExperimentName()},
+            {"experiment_group",
+             experiment_.GetMode() == ExperimentManager::Mode::kOff
+                 ? "" : experiment_.Group(user_id)},
+            {"rank_mode", rank_mode},
+            {"model_version", model_version},
+            {"candidates", audit_candidates},
+        };
+
         result.success = true;
         nlohmann::json out;
         out["items"] = out_items;
         out["total"] = scored.size();
+        out["rank_audit"] = rank_audit;
         result.result_json = out.dump();
-        spdlog::info("deal_ranker: budget={}, taboo='{}' -> {}/{} kept",
-                     budget, taboo, out_items.size(), candidates.size());
+        spdlog::info("deal_ranker: budget={}, taboo='{}', mode={}, group={} -> {}/{} kept",
+                     budget, taboo, rank_mode,
+                     rank_audit["experiment_group"].get<std::string>(),
+                     out_items.size(), candidates.size());
     } catch (const std::exception& e) {
         result.success = false;
         result.error_message = std::string("deal_ranker error: ") + e.what();

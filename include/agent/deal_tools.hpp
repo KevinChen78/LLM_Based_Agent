@@ -2,6 +2,8 @@
 
 #include "agent/common.hpp"
 #include "agent/deal_catalog.hpp"
+#include "agent/experiment_manager.hpp"
+#include "agent/ranker_client.hpp"
 #include "agent/retrieval_client.hpp"
 #include "agent/tool_registry.hpp"
 
@@ -39,14 +41,31 @@ private:
 // optional taboo filtering. When `candidates` is empty the orchestrator injects
 // the accumulated retriever results, enabling deterministic retrieve→rank
 // chaining without relying on the LLM to forward candidates.
+//
+// Phase 2.1 (learning-to-rank): when a RankerClient is injected and the
+// ExperimentManager puts this user on the model path (RANKER_MODE=active +
+// treatment bucket), ordering comes from the ranking service's model scores.
+// The rule score is ALWAYS computed — it is the fallback on any service
+// failure and is reported alongside model scores in the `rank_audit` output
+// field (persisted to recommendation_logs by the orchestrator). In shadow
+// mode the model is called for audit only; serving stays on rule scores.
+// Taboo filtering always runs locally BEFORE any model call — safety
+// semantics are never delegated to the model.
 class DealRanker : public ITool {
 public:
+    explicit DealRanker(std::shared_ptr<RankerClient> ranker = nullptr,
+                        ExperimentManager experiment = ExperimentManager::FromEnv());
+
     std::string Name() const override { return "deal_ranker"; }
     std::string Description() const override {
         return "对召回候选做多因子重排（评分/销量/价格契合/折扣）并取 top_n";
     }
     std::string SchemaJson() const override;
     coro::Task<ToolResult> Execute(const ToolCall& call) override;
+
+private:
+    std::shared_ptr<RankerClient> ranker_;   // nullptr => rule-only (offline)
+    ExperimentManager experiment_;           // kOff by default
 };
 
 // Knowledge-base RAG retriever (tool name `kb_search`). Forwards a natural-

@@ -8,6 +8,9 @@ add_executable(test_agent
     test_composer.cpp
     test_kb.cpp
     test_observability.cpp
+    test_experiment.cpp
+    test_ranker_client.cpp
+    test_user_profile.cpp
 )
 
 target_link_libraries(test_agent PRIVATE

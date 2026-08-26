@@ -19,6 +19,8 @@ class LlmClient;
 class ResponseComposer;
 class SafetyGuard;
 class ObservabilityStore;
+class UserProfileStore;
+class DealCatalog;
 
 class AgentOrchestrator {
 public:
@@ -34,7 +36,12 @@ public:
         std::shared_ptr<LlmClient> llm,
         std::shared_ptr<ResponseComposer> composer,
         std::shared_ptr<SafetyGuard> guard = nullptr,
-        std::shared_ptr<ObservabilityStore> obs = nullptr);
+        std::shared_ptr<ObservabilityStore> obs = nullptr,
+        // Phase 2.2: user profiles injected into the planner prompt. Both
+        // null (or an empty user_id) => no profile section, behaviour
+        // unchanged.
+        std::shared_ptr<UserProfileStore> profiles = nullptr,
+        std::shared_ptr<DealCatalog> catalog = nullptr);
 
     // Non-streaming chat: returns the complete result.
     coro::Task<RecommendationResult> Chat(Request req);
@@ -51,6 +58,7 @@ private:
     struct RecAudit {
         std::vector<LlmCallInfo> llm_calls;  // planner attempts + composer call
         std::string slots_json;
+        std::string rank_audit_json;         // ranker tool's rank_audit object (Phase 2.1)
     };
 
     coro::Task<RecommendationResult> ChatStreamInner(
@@ -63,6 +71,8 @@ private:
     std::shared_ptr<ResponseComposer> composer_;
     std::shared_ptr<SafetyGuard> guard_;
     std::shared_ptr<ObservabilityStore> obs_;
+    std::shared_ptr<UserProfileStore> profiles_;
+    std::shared_ptr<DealCatalog> catalog_;   // for profile extraction lookups
 };
 
 } // namespace agent

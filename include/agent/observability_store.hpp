@@ -33,6 +33,10 @@ public:
         int grounding_count = 0;
         std::string compose_mode;      // llm_stream / llm / template / short_circuit / none
         long latency_ms = 0;
+        // Learning-to-rank audit (Phase 2.1); empty when no ranker ran.
+        std::string candidates_json;   // ranker input candidates [{item_id, rule_score, model_score|null}] cap 50
+        std::string experiment_group;  // control / treatment / "" (experiment off)
+        std::string rank_mode;         // rule / model / rule_fallback / "" (no ranker this request)
     };
 
     struct LlmCallEntry {

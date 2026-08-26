@@ -1,4 +1,6 @@
 #include "agent/agent_orchestrator.hpp"
+#include "agent/deal_catalog.hpp"
+#include "agent/preference_extractor.hpp"
 #include "agent/task_planner.hpp"
 #include "agent/tool_registry.hpp"
 #include "agent/session_memory.hpp"
@@ -6,6 +8,7 @@
 #include "agent/observability_store.hpp"
 #include "agent/response_composer.hpp"
 #include "agent/safety_guard.hpp"
+#include "agent/user_profile_store.hpp"
 
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
@@ -13,6 +16,8 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <iomanip>
+#include <sstream>
 #include <string_view>
 
 namespace agent {
@@ -40,9 +45,66 @@ void FinishIf(const std::shared_ptr<StreamEmitter>& emitter,
     }
 }
 
+// ISO-8601 local timestamp for (now - minutes). The stores write updated_at
+// with the same fixed-width format, so lexicographic == chronological.
+std::string IsoMinutesAgo(int minutes) {
+    auto t = std::chrono::system_clock::to_time_t(
+        std::chrono::system_clock::now() - std::chrono::minutes(minutes));
+    std::stringstream ss;
+    ss << std::put_time(std::localtime(&t), "%Y-%m-%dT%H:%M:%S");
+    return ss.str();
+}
+
+// Resolve the cross-session user profile for the planner prompt (Phase 2.2):
+// read the cached row; if missing or stale (>5 min), re-extract from
+// feedback/slot signals and upsert. Any failure or empty profile yields an
+// empty object, which leaves the prompt byte-identical to no-profile runs.
+nlohmann::json ResolveUserProfile(UserProfileStore* profiles,
+                                  DealCatalog* catalog,
+                                  const std::string& user_id) {
+    const auto empty = nlohmann::json::object();
+    if (!profiles || !catalog || user_id.empty()) return empty;
+    try {
+        auto prof = profiles->Get(user_id);
+        const bool fresh = prof && !prof->updated_at.empty() &&
+                           prof->updated_at >= IsoMinutesAgo(5);
+        if (!fresh) {
+            UserProfile p = PreferenceExtractor::Extract(
+                user_id, profiles->LoadFeedbackSignals(user_id),
+                profiles->LoadSlotHistory(user_id), *catalog);
+            // Only cache profiles that carry real signals. Caching an
+            // all-defaults row would hide the user's first feedback for the
+            // whole TTL; skipping the upsert costs two cheap reads per
+            // request for signal-less users instead.
+            const bool has_signals = !p.preferred_categories.empty() ||
+                !p.preferred_cities.empty() || p.avg_budget > 0.0 ||
+                !p.dietary_tags.empty();
+            if (has_signals) {
+                if (profiles->Upsert(p)) prof = p;
+            }
+        }
+        if (!prof) return empty;
+        // No signals yet => no prompt section (avoid teaching the planner to
+        // lean on an all-defaults profile).
+        if (prof->preferred_categories.empty() && prof->preferred_cities.empty() &&
+            prof->avg_budget <= 0.0 && prof->dietary_tags.empty()) {
+            return empty;
+        }
+        return nlohmann::json{
+            {"preferred_cities", prof->preferred_cities},
+            {"preferred_categories", prof->preferred_categories},
+            {"avg_budget", prof->avg_budget},
+            {"dietary_tags", prof->dietary_tags},
+            {"price_sensitivity", prof->price_sensitivity},
+        };
+    } catch (const std::exception& e) {
+        spdlog::warn("user profile resolve failed ({}); continuing without", e.what());
+        return empty;
+    }
+}
+
 // Render one knowledge passage as a compact readable snippet.
-std::string FormatPassage(const nlohmann::json& p) {
-    std::string title = p.value("title", "");
+std::string FormatPassage(const nlohmann::json& p) {    std::string title = p.value("title", "");
     std::string content = p.value("content", "");
     std::string source = p.value("source", "");
     std::string s;
@@ -61,14 +123,18 @@ AgentOrchestrator::AgentOrchestrator(
     std::shared_ptr<LlmClient> llm,
     std::shared_ptr<ResponseComposer> composer,
     std::shared_ptr<SafetyGuard> guard,
-    std::shared_ptr<ObservabilityStore> obs)
+    std::shared_ptr<ObservabilityStore> obs,
+    std::shared_ptr<UserProfileStore> profiles,
+    std::shared_ptr<DealCatalog> catalog)
     : planner_(std::move(planner))
     , tools_(std::move(tools))
     , memory_(std::move(memory))
     , llm_(std::move(llm))
     , composer_(std::move(composer))
     , guard_(std::move(guard))
-    , obs_(std::move(obs)) {}
+    , obs_(std::move(obs))
+    , profiles_(std::move(profiles))
+    , catalog_(std::move(catalog)) {}
 
 coro::Task<RecommendationResult> AgentOrchestrator::Chat(Request req) {
     // Non-streaming path: use the streaming implementation with a null emitter.
@@ -108,6 +174,20 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStream(
         e.compose_mode = result.compose_mode.empty() ? "none" : result.compose_mode;
         e.latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start).count();
+        // Learning-to-rank audit fields (Phase 2.1). Fire-and-forget: any
+        // parse failure leaves the columns empty rather than failing the log.
+        if (!audit.rank_audit_json.empty()) {
+            try {
+                auto ra = nlohmann::json::parse(audit.rank_audit_json);
+                e.experiment_group = ra.value("experiment_group", "");
+                e.rank_mode = ra.value("rank_mode", "");
+                if (ra.contains("candidates") && ra["candidates"].is_array()) {
+                    e.candidates_json = ra["candidates"].dump();
+                }
+            } catch (const std::exception& ex) {
+                spdlog::warn("Failed to parse rank_audit: {}", ex.what());
+            }
+        }
         obs_->LogRecommendation(e);
 
         for (const auto& c : audit.llm_calls) {
@@ -179,10 +259,14 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
         // 4. Retrieve history
         auto history = co_await memory_->GetRecentTurns(session.session_id, 10);
 
-        // 5. Plan next step
+        // 5. Plan next step (with the cross-session user profile, Phase 2.2 —
+        // empty object when profiles are unwired/anonymous/no signals).
         EmitIf(emitter, "planning", nlohmann::json{{"detail", "deciding next step"}});
+        const nlohmann::json user_profile = ResolveUserProfile(
+            profiles_.get(), catalog_.get(), req.user_context.user_id);
         auto plan = co_await planner_->PlanNextStep(
-            req.user_context, history, req.user_message, session.context);
+            req.user_context, history, req.user_message, session.context,
+            user_profile);
         if (audit) {
             audit->slots_json = plan.slots.dump();
             for (auto& c : plan.llm_calls) audit->llm_calls.push_back(std::move(c));
@@ -260,9 +344,19 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
                     auto args = nlohmann::json::parse(call.arguments_json);
                     if (!args.contains("candidates") || args["candidates"].empty()) {
                         args["candidates"] = accumulated_items;
-                        effective.arguments_json = args.dump();
                         injected = !accumulated_items.empty();
                     }
+                    // user_id is injected by the orchestrator (not part of the
+                    // LLM-visible tool schema) so the ranker can bucket
+                    // experiments and the ranking service can read profiles.
+                    args["user_id"] = req.user_context.user_id;
+                    // City/category feed the model's context-cross features;
+                    // they come from the planned slots, not the LLM's args.
+                    if (plan.slots.is_object()) {
+                        if (plan.slots.contains("city")) args["city"] = plan.slots["city"];
+                        if (plan.slots.contains("category")) args["category"] = plan.slots["category"];
+                    }
+                    effective.arguments_json = args.dump();
                 } catch (const std::exception& e) {
                     spdlog::warn("Failed to inspect ranker args for chaining: {}", e.what());
                 }
@@ -296,6 +390,12 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
                 if (is_ranker(call.tool_name)) {
                     // A ranker refines the candidate set: its output replaces.
                     accumulated_items = j["items"];
+                    // Learning-to-rank audit (Phase 2.1): the ranker reports
+                    // experiment group / rank mode / per-candidate scores; the
+                    // outer shell persists them into recommendation_logs.
+                    if (audit && j.contains("rank_audit") && j["rank_audit"].is_object()) {
+                        audit->rank_audit_json = j["rank_audit"].dump();
+                    }
                 } else {
                     // A retriever (or other producer) adds candidates.
                     for (const auto& it : j["items"]) accumulated_items.push_back(it);

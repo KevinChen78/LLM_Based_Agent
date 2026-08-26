@@ -7,3 +7,7 @@ psycopg[binary,pool]>=3.2,<4
 # Vector recall (RETRIEVAL_VECTOR=on): ONNX-runtime embeddings, no torch.
 # Ships Windows/py3.13 wheels; pulls onnxruntime.
 fastembed>=0.4,<1
+
+# Learning-to-rank (Phase 2.1): ranking_service + scripts/train_ranker.py only.
+# llm_gateway / e2e / generators / evaluators stay pure stdlib.
+lightgbm>=4.0,<5

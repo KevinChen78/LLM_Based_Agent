@@ -17,6 +17,7 @@
 #include "agent/sqlite_session_store.hpp"
 #include "agent/task_planner.hpp"
 #include "agent/tool_registry.hpp"
+#include "agent/user_profile_store.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -179,7 +180,17 @@ int main() {
     std::string retr_url = retr_env ? retr_env : "";
     auto retrieval = std::make_shared<RetrievalClient>(retr_url);
     tools->Register(std::make_shared<DealRetriever>(catalog, retrieval));
-    tools->Register(std::make_shared<DealRanker>());
+    // Learning-to-rank service (Phase 2.1). Enabled by setting
+    //   RANKER_SERVICE_URL=http://localhost:8002
+    //   RANKER_MODE=off|shadow|active   (default off — zero added latency)
+    //   RANKER_TREATMENT_PCT=0..100     (active mode, default 50)
+    // DealRanker always computes rule scores; any service failure or missing
+    // model falls back to them, so offline behaviour is unchanged.
+    const char* rank_env = std::getenv("RANKER_SERVICE_URL");
+    std::string rank_url = rank_env ? rank_env : "";
+    auto ranker_client = std::make_shared<RankerClient>(rank_url);
+    auto experiment = ExperimentManager::FromEnv();
+    tools->Register(std::make_shared<DealRanker>(ranker_client, experiment));
     std::cout << "Retrieval backend: Catalog (backend=" << catalog_backend
               << ", source=" << catalog->Source()
               << ", " << catalog->Size() << " deals)" << std::endl;
@@ -190,6 +201,20 @@ int main() {
                   << (up ? "" : " [unreachable — will degrade to local]") << std::endl;
     } else {
         std::cout << "Retrieval service: disabled (set RETRIEVAL_SERVICE_URL to enable BM25 + kb_search)" << std::endl;
+    }
+    {
+        const char* mode_str = experiment.GetMode() == ExperimentManager::Mode::kActive ? "active"
+            : experiment.GetMode() == ExperimentManager::Mode::kShadow ? "shadow" : "off";
+        if (ranker_client->Enabled()) {
+            bool up = ranker_client->Healthy();
+            std::cout << "Ranking service: " << rank_url << " (mode=" << mode_str
+                      << ", experiment=" << experiment.ExperimentName()
+                      << ", treatment=" << experiment.TreatmentPct() << "%)"
+                      << (up ? "" : " [unreachable — rule scores only]") << std::endl;
+        } else {
+            std::cout << "Ranking service: disabled (mode=" << mode_str
+                      << "; set RANKER_SERVICE_URL to enable learning-to-rank)" << std::endl;
+        }
     }
     // Session storage: SQLite (persistent) by default, InMemory fallback.
     //   SESSION_STORE=sqlite|memory   (default sqlite)
@@ -214,10 +239,26 @@ int main() {
     std::string obs_db_path = obs_env ? obs_env : "data/observability.db";
     auto obs = std::make_shared<ObservabilityStore>(obs_db_path);
     std::cout << "Observability: SQLite (" << obs_db_path << ")" << std::endl;
+    // User profiles (Phase 2.2): cross-session preferences injected into the
+    // planner prompt. Lives in the sessions DB on its own connection; only
+    // available with the SQLite session store (memory mode => no profiles,
+    // the planner prompt carries no profile section).
+    std::shared_ptr<UserProfileStore> profiles;
+    if (store_kind != "memory") {
+        try {
+            profiles = std::make_shared<SqliteUserProfileStore>(sessions_db_path);
+            std::cout << "User profiles: SQLite (" << sessions_db_path
+                      << ", user_profiles table)" << std::endl;
+        } catch (const std::exception& e) {
+            std::cout << "User profiles: disabled (open failed: " << e.what() << ")" << std::endl;
+        }
+    } else {
+        std::cout << "User profiles: disabled (SESSION_STORE=memory)" << std::endl;
+    }
     auto composer = std::make_shared<ResponseComposer>(llm);
     auto guard = std::make_shared<SafetyGuard>();
     auto orchestrator = std::make_shared<AgentOrchestrator>(
-        planner, tools, memory, llm, composer, guard, obs);
+        planner, tools, memory, llm, composer, guard, obs, profiles, catalog);
 
     // Web UI static assets. Served from WEB_DIR (default "web", relative to
     // cwd) on the same origin as the API, so no CORS is needed. The coro

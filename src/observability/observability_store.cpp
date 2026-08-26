@@ -71,6 +71,29 @@ void ObservabilityStore::InitSchema() {
             throw std::runtime_error("ObservabilityStore schema init failed: " + msg);
         }
     };
+    // Idempotent migration: ALTER TABLE ADD COLUMN only when the column is
+    // absent, so existing database files upgrade in place.
+    auto add_column_if_missing = [this, &exec](const char* table, const char* col,
+                                               const char* ddl_type) {
+        sqlite3_stmt* raw = nullptr;
+        const std::string pragma = std::string("PRAGMA table_info(") + table + ")";
+        if (sqlite3_prepare_v2(db_, pragma.c_str(), -1, &raw, nullptr) != SQLITE_OK) {
+            throw std::runtime_error("ObservabilityStore schema init failed: " +
+                                     std::string(sqlite3_errmsg(db_)));
+        }
+        bool found = false;
+        {
+            StmtGuard g(raw);
+            while (sqlite3_step(raw) == SQLITE_ROW) {
+                if (ColStr(raw, 1) == col) { found = true; break; }
+            }
+        }
+        if (!found) {
+            const std::string alter = std::string("ALTER TABLE ") + table +
+                                      " ADD COLUMN " + col + " " + ddl_type;
+            exec(alter.c_str());
+        }
+    };
     // WAL so the api_server connection and offline evaluators can coexist;
     // busy_timeout smooths over concurrent single-writer conflicts.
     exec("PRAGMA journal_mode=WAL;");
@@ -95,6 +118,11 @@ void ObservabilityStore::InitSchema() {
     )");
     exec("CREATE INDEX IF NOT EXISTS idx_rec_logs_trace ON recommendation_logs(trace_id);");
     exec("CREATE INDEX IF NOT EXISTS idx_rec_logs_session ON recommendation_logs(session_id, rowid);");
+    // Phase 2.1 learning-to-rank audit columns (added after the base table so
+    // existing databases pick them up via ALTER).
+    add_column_if_missing("recommendation_logs", "candidates_json", "TEXT");
+    add_column_if_missing("recommendation_logs", "experiment_group", "TEXT");
+    add_column_if_missing("recommendation_logs", "rank_mode", "TEXT");
     exec(R"(
         CREATE TABLE IF NOT EXISTS llm_calls (
             rowid             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,8 +148,8 @@ void ObservabilityStore::LogRecommendation(const RecLogEntry& e) {
             "INSERT INTO recommendation_logs "
             "(trace_id, session_id, user_id, request_text, action, slots_json, "
             " item_count, ranked_items, response_text, grounding_count, compose_mode, "
-            " latency_ms, created_at) "
-            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            " latency_ms, created_at, candidates_json, experiment_group, rank_mode) "
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             -1, &raw, nullptr) != SQLITE_OK) {
         spdlog::warn("LogRecommendation prepare failed: {}", sqlite3_errmsg(db_));
         return;
@@ -141,6 +169,9 @@ void ObservabilityStore::LogRecommendation(const RecLogEntry& e) {
     sqlite3_bind_text(raw, 11, e.compose_mode.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(raw, 12, e.latency_ms);
     sqlite3_bind_text(raw, 13, now.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(raw, 14, e.candidates_json.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(raw, 15, e.experiment_group.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(raw, 16, e.rank_mode.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(raw) != SQLITE_DONE) {
         // Audit writes must never break the recommendation path.
         spdlog::warn("LogRecommendation insert failed: {}", sqlite3_errmsg(db_));
