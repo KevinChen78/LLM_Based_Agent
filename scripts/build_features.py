@@ -15,8 +15,13 @@ Pure stdlib, idempotent (full rebuild each run), safe to run while the
 api_server is up: source DBs are opened read-only, the output DB is a
 separate file written in one transaction.
 
+Simulated rows (simulate_feedback.py, user_id LIKE 'sim-%') are EXCLUDED by
+default so the item_features used by production training stay real-traffic
+only; pass --include-sim to smoke the pipeline with them.
+
 Usage:
     python scripts/build_features.py
+    python scripts/build_features.py --include-sim
     python scripts/build_features.py --obs data/observability.db \
         --sessions data/sessions.db --deals data/deals.json \
         --out data/ranking_features.db
@@ -53,7 +58,7 @@ def load_categories(deals_path):
             if d.get("item_id")}
 
 
-def load_impressions(obs_path):
+def load_impressions(obs_path, include_sim):
     """item_id -> exposure count, from recommendation_logs.candidates_json."""
     conn = connect_ro(obs_path)
     if conn is None:
@@ -64,10 +69,12 @@ def load_impressions(obs_path):
             print("[features] recommendation_logs has no candidates_json column"
                   " yet (pre-Phase-2.1 db); impressions all zero")
             return Counter()
+        sql = ("SELECT candidates_json FROM recommendation_logs"
+               " WHERE candidates_json IS NOT NULL AND candidates_json != ''")
+        if not include_sim:
+            sql += " AND (user_id IS NULL OR user_id NOT LIKE 'sim-%')"
         impressions = Counter()
-        for (blob,) in conn.execute(
-                "SELECT candidates_json FROM recommendation_logs"
-                " WHERE candidates_json IS NOT NULL AND candidates_json != ''"):
+        for (blob,) in conn.execute(sql):
             try:
                 for cand in json.loads(blob):
                     item_id = cand.get("item_id")
@@ -80,17 +87,20 @@ def load_impressions(obs_path):
         conn.close()
 
 
-def load_feedback(sessions_path):
+def load_feedback(sessions_path, include_sim):
     """item_id -> (likes, dislikes). Item-level rows only (item_id != '')."""
     conn = connect_ro(sessions_path)
     if conn is None:
         return Counter(), Counter()
     try:
         likes, dislikes = Counter(), Counter()
-        for item_id, ftype, n in conn.execute(
-                "SELECT item_id, feedback_type, COUNT(*) FROM feedback"
-                " WHERE item_id IS NOT NULL AND item_id != ''"
-                " GROUP BY item_id, feedback_type"):
+        sql = ("SELECT f.item_id, f.feedback_type, COUNT(*) FROM feedback f"
+               " JOIN sessions s ON s.session_id = f.session_id"
+               " WHERE f.item_id IS NOT NULL AND f.item_id != ''")
+        if not include_sim:
+            sql += " AND (s.user_id IS NULL OR s.user_id NOT LIKE 'sim-%')"
+        sql += " GROUP BY f.item_id, f.feedback_type"
+        for item_id, ftype, n in conn.execute(sql):
             if ftype == "like":
                 likes[item_id] = n
             elif ftype == "dislike":
@@ -106,11 +116,15 @@ def main():
     ap.add_argument("--obs", default=os.path.join(_PROJECT, "data", "observability.db"))
     ap.add_argument("--sessions", default=os.path.join(_PROJECT, "data", "sessions.db"))
     ap.add_argument("--out", default=os.path.join(_PROJECT, "data", "ranking_features.db"))
+    ap.add_argument("--include-sim", action="store_true",
+                    help="include simulate_feedback.py rows (user_id LIKE"
+                         " 'sim-%%'); default EXCLUDES them so production"
+                         " features stay real-traffic only")
     args = ap.parse_args()
 
     categories = load_categories(args.deals)
-    impressions = load_impressions(args.obs)
-    likes, dislikes = load_feedback(args.sessions)
+    impressions = load_impressions(args.obs, args.include_sim)
+    likes, dislikes = load_feedback(args.sessions, args.include_sim)
 
     # category_hot: add-one smoothed share of likes per category.
     cat_likes = Counter()
@@ -152,7 +166,8 @@ def main():
 
     print(f"[features] item_features rebuilt: {len(item_ids)} items"
           f" (impressions>0: {sum(1 for v in impressions.values() if v)},"
-          f" with feedback: {len(set(likes) | set(dislikes))}) -> {args.out}")
+          f" with feedback: {len(set(likes) | set(dislikes))}) -> {args.out}"
+          + ("" if args.include_sim else " [sim- excluded]"))
     return 0
 
 

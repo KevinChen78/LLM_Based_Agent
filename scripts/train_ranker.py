@@ -20,8 +20,9 @@ serving model_loaded=false (C++ falls back to rule scoring).
 
 Usage:
     python scripts/build_features.py            # refresh stats first
-    python scripts/train_ranker.py              # real data
+    python scripts/train_ranker.py              # real data (sim- excluded)
     python scripts/train_ranker.py --synthetic  # smoke test, no real DBs
+    python scripts/train_ranker.py --include-sim  # pipeline smoke on sim rows
 """
 
 import argparse
@@ -124,7 +125,7 @@ def _ranks_from_rule_scores(rule_scores):
 
 
 def dataset_from_logs(obs_db, sessions_db, deals_path, features_db,
-                      implicit_negatives):
+                      implicit_negatives, include_sim=False):
     """Returns (rows, labels, groups) or None when the obs db lacks data."""
     conn = connect_ro(obs_db)
     if conn is None:
@@ -136,15 +137,17 @@ def dataset_from_logs(obs_db, sessions_db, deals_path, features_db,
             print("[train] recommendation_logs has no candidates_json column"
                   " yet; deploy the Phase 2.1 api_server first")
             return None
-        logs = conn.execute(
-            "SELECT trace_id, user_id, slots_json, candidates_json"
-            " FROM recommendation_logs"
-            " WHERE candidates_json IS NOT NULL AND candidates_json != ''"
-        ).fetchall()
+        sql = ("SELECT trace_id, user_id, slots_json, candidates_json"
+               " FROM recommendation_logs"
+               " WHERE candidates_json IS NOT NULL AND candidates_json != ''")
+        if not include_sim:
+            sql += " AND (user_id IS NULL OR user_id NOT LIKE 'sim-%')"
+        logs = conn.execute(sql).fetchall()
     finally:
         conn.close()
     if not logs:
-        print("[train] no recommendation_logs rows with candidates_json yet")
+        print("[train] no recommendation_logs rows with candidates_json yet"
+              + ("" if include_sim else " (sim- rows excluded by default)"))
         return None
 
     items = load_items(deals_path)
@@ -254,13 +257,18 @@ def main():
     ap.add_argument("--synthetic", type=int, nargs="?", const=200, metavar="N",
                     help="ignore real DBs; train on N synthetic requests (smoke)")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--include-sim", action="store_true",
+                    help="include simulate_feedback.py rows (user_id LIKE"
+                         " 'sim-%%'); default EXCLUDES them — simulated data"
+                         " validates the pipeline, never model quality")
     args = ap.parse_args()
 
     if args.synthetic:
         data = synthetic_dataset(args.synthetic, args.seed)
     else:
         data = dataset_from_logs(args.obs, args.sessions, args.deals,
-                                 args.features_db, args.implicit_negatives)
+                                 args.features_db, args.implicit_negatives,
+                                 include_sim=args.include_sim)
     if data is None:
         print("[train] no model written (no data)")
         return 2
@@ -318,6 +326,9 @@ def main():
         "n_positives": pos,
         "n_groups": len(groups),
         "synthetic": bool(args.synthetic),
+        # True when the training set included simulate_feedback.py rows —
+        # such a model is a pipeline-smoke artifact, not an effect candidate.
+        "includes_sim": bool(args.include_sim) and not args.synthetic,
     }
     with open(os.path.join(args.out_dir, "meta.json"), "w", encoding="utf-8") as fh:
         json.dump(meta, fh, ensure_ascii=False, indent=2)

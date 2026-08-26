@@ -163,13 +163,32 @@ def main():
     if statuses:
         print("  状态分布: " + ", ".join(f"{r['s']}={r['c']}" for r in statuses))
 
-    # ---- 反馈满意率 ----
+    # ---- 反馈满意率(按流量口径拆分;sim 数据不污染真实满意率) ----
     if has_sessions:
-        fb = q("SELECT feedback_type t, COUNT(*) c FROM sessions_db.feedback GROUP BY t")
-        likes = sum(r["c"] for r in fb if r["t"] == "like")
-        dislikes = sum(r["c"] for r in fb if r["t"] == "dislike")
-        print(f"\n■ 反馈: 👍 {likes} / 👎 {dislikes} "
-              f"(满意率 {pct(likes, likes + dislikes)})")
+        fb_rows = q("SELECT f.feedback_type t, f.trace_id tr, s.user_id u "
+                    "FROM sessions_db.feedback f "
+                    "JOIN sessions_db.sessions s ON s.session_id = f.session_id")
+        fb_cohorts = {"real": {"like": 0, "dislike": 0},
+                      "test": {"like": 0, "dislike": 0},
+                      "sim": {"like": 0, "dislike": 0}}
+        for r in fb_rows:
+            uid = r["u"] or ""
+            if uid.startswith("sim-"):
+                c = "sim"
+            elif uid == "e2e" or (r["tr"] or "") in stub_traces:
+                c = "test"
+            else:
+                c = "real"
+            if r["t"] in fb_cohorts[c]:
+                fb_cohorts[c][r["t"]] += 1
+        print("\n■ 反馈满意率(按流量口径)")
+        for c in ("real", "test", "sim"):
+            lk, dl = fb_cohorts[c]["like"], fb_cohorts[c]["dislike"]
+            if lk + dl:
+                print(f"  {COHORT_LABEL[c]:<10} 👍 {lk} / 👎 {dl} "
+                      f"(满意率 {pct(lk, lk + dl)})")
+        if not any(v["like"] + v["dislike"] for v in fb_cohorts.values()):
+            print("  (暂无反馈)")
         disliked = q("SELECT item_id, COUNT(*) c FROM sessions_db.feedback "
                      "WHERE feedback_type='dislike' AND item_id != '' "
                      "GROUP BY item_id ORDER BY c DESC LIMIT 5")
