@@ -38,7 +38,11 @@ struct FactCheckResult {
 //                    words from the final reply and item reasons.
 class SafetyGuard {
 public:
-    SafetyGuard();
+    // Phase 4-C: `rules_path` optionally points at a JSON file
+    // (data/guard_rules.json) overriding the built-in rule lists. A missing
+    // or malformed file keeps the built-in defaults byte-identical to before
+    // (degradation-chain consistent: the guard never fails to construct).
+    explicit SafetyGuard(const std::string& rules_path = "");
 
     // Synchronous input check. Runs before the TaskPlanner.
     InputGuardResult CheckInput(const std::string& user_message) const;
@@ -46,7 +50,9 @@ public:
     // Mask PII (phone / email / ID card / long digit runs) in arbitrary text.
     static std::string MaskPii(const std::string& text);
 
-    // Strip banned words (*** ) from reply text.
+    // Strip banned words (*** ) from reply text using the built-in default
+    // list. Kept static for compatibility; SanitizeOutputText uses the
+    // (possibly file-overridden) member list instead.
     static std::string StripBannedWords(const std::string& text);
 
     // Sanitize the final reply text (PII mask + banned-word strip).

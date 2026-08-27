@@ -283,7 +283,12 @@ int main() {
     } else {
         std::cout << "User profiles: disabled (SESSION_STORE=memory)" << std::endl;
     }
-    auto guard = std::make_shared<SafetyGuard>();
+    // Phase 4-C: guard rules externalized to JSON; missing/malformed file
+    // falls back to the built-in defaults (byte-identical behavior).
+    const char* rules_env = std::getenv("GUARD_RULES_PATH");
+    const std::string guard_rules =
+        (rules_env && *rules_env) ? rules_env : "data/guard_rules.json";
+    auto guard = std::make_shared<SafetyGuard>(guard_rules);
     auto composer = std::make_shared<ResponseComposer>(llm, guard);
     auto orchestrator = std::make_shared<AgentOrchestrator>(
         planner, tools, memory, llm, composer, guard, obs, profiles, catalog);

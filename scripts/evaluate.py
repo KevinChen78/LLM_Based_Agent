@@ -12,6 +12,7 @@ per request, one llm_calls row per LLM call) and ATTACHes the sessions DB
   - LLM token spend by purpose (streaming compose rows honestly report 0)
   - grounding rate
   - feedback satisfaction + most-disliked items
+  - guard action distribution & fact-violation details (Phase 4-C)
 
 Usage:
     python scripts/evaluate.py [--obs data/observability.db] [--sessions data/sessions.db]
@@ -271,6 +272,26 @@ def main():
             if counts:
                 print(f"  候选集: avg {sum(counts)/len(counts):.1f} 条/请求, "
                       f"含模型分 {pct(with_model, len(counts))}")
+
+    # ---- Guard 动作（Phase 4-C；旧库无这些列则整段跳过）----
+    cols = {r["name"] for r in q("PRAGMA table_info(recommendation_logs)")}
+    if {"guard_action", "guard_detail"} <= cols:
+        print("\n■ Guard 动作（Phase 4）")
+        ga = q("SELECT COALESCE(NULLIF(guard_action,''),'none') a, COUNT(*) c "
+               "FROM recommendation_logs GROUP BY a ORDER BY c DESC")
+        print("  guard_action 分布: " + (", ".join(f"{r['a']}={r['c']}" for r in ga)
+                                        if ga else "(无数据)"))
+        n_fv = sum(r["c"] for r in ga if r["a"] == "fact_violation")
+        if total:
+            print(f"  事实违规率 (fact_violation): {pct(n_fv, total)}"
+                  + ("  ⚠ 偏高,检查 compose prompt 与数据一致性" if total and n_fv / total > 0.05 else ""))
+        fv = q("SELECT guard_detail d, response_text r, compose_mode m, created_at t "
+               "FROM recommendation_logs WHERE guard_action='fact_violation' "
+               "ORDER BY rowid DESC LIMIT 10")
+        if fv:
+            print("  fact_violation 明细(最近 10 条):")
+            for r in fv:
+                print(f"    [{r['t']}] ({r['m']}) {(r['d'] or '')[:100]}")
 
     con.close()
     print("\n" + "=" * 60)

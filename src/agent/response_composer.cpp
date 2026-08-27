@@ -108,6 +108,24 @@ std::optional<std::string> TryParseComposition(const std::string& raw,
     return ApplyComposition(*j, items);
 }
 
+// Cap for the guard_detail audit string (violations are short, but a
+// pathological reply could produce many — keep the DB row small).
+constexpr size_t kGuardDetailCap = 400;
+
+// Join fact-check violations into the audit detail string (capped).
+std::string GuardDetail(const FactCheckResult& fc) {
+    std::string detail;
+    for (const auto& v : fc.violations) {
+        if (!detail.empty()) detail += "; ";
+        detail += v;
+        if (detail.size() >= kGuardDetailCap) {
+            detail.resize(kGuardDetailCap);
+            break;
+        }
+    }
+    return detail;
+}
+
 } // namespace
 
 ResponseComposer::ResponseComposer(std::shared_ptr<LlmClient> llm,
@@ -179,17 +197,15 @@ coro::Task<RecommendationResult> ResponseComposer::Compose(
                         if (!fc.ok) {
                             info.status = "guard_fallback";
                             result.llm_calls.push_back(std::move(info));
-                            std::string detail;
-                            for (const auto& v : fc.violations) {
-                                if (!detail.empty()) detail += "; ";
-                                detail += v;
-                            }
+                            const std::string detail = GuardDetail(fc);
                             spdlog::warn("ResponseComposer: streamed reply failed "
                                          "fact check ({}), emitting replace.", detail);
                             std::string t = BuildTemplateReply(result.items);
                             emitter->Emit("replace", {{"content", t}});
                             result.compose_mode = "llm_stream_guard_fallback";
                             result.response_text = std::move(t);
+                            result.guard_action = "fact_violation";
+                            result.guard_detail = detail;
                             co_return result;
                         }
                     }
@@ -248,15 +264,13 @@ coro::Task<RecommendationResult> ResponseComposer::Compose(
                     if (!fc.ok) {
                         info.status = "guard_fallback";
                         result.llm_calls.push_back(std::move(info));
-                        std::string detail;
-                        for (const auto& v : fc.violations) {
-                            if (!detail.empty()) detail += "; ";
-                            detail += v;
-                        }
+                        const std::string detail = GuardDetail(fc);
                         spdlog::warn("ResponseComposer: fact check failed ({}), "
                                      "using template.", detail);
                         result.compose_mode = "template_guard_fallback";
                         result.response_text = BuildTemplateReply(result.items);
+                        result.guard_action = "fact_violation";
+                        result.guard_detail = detail;
                         co_return result;
                     }
                 }

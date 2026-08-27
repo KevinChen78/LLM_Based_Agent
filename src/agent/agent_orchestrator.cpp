@@ -186,6 +186,8 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStream(
         e.response_text = result.response_text;
         e.grounding_count = static_cast<int>(result.grounding.size());
         e.compose_mode = result.compose_mode.empty() ? "none" : result.compose_mode;
+        e.guard_action = result.guard_action;
+        e.guard_detail = result.guard_detail;
         e.latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start).count();
         // Learning-to-rank audit fields (Phase 2.1). Fire-and-forget: any
@@ -249,6 +251,8 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
                 result.response_text = guard_result.refusal_reply;
                 result.next_state = "BLOCKED";
                 result.is_clarifying = false;
+                result.guard_action = "refuse_input";
+                result.guard_detail = guard_result.risk_type + ": " + guard_result.reason;
                 EmitIf(emitter, "input_guard", nlohmann::json{
                     {"status", "blocked"},
                     {"risk_type", guard_result.risk_type},
@@ -483,6 +487,8 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
         result.response_text = composed.response_text;
         result.items = std::move(composed.items);
         result.compose_mode = composed.compose_mode;
+        result.guard_action = std::move(composed.guard_action);
+        result.guard_detail = std::move(composed.guard_detail);
         if (audit) {
             for (auto& c : composed.llm_calls) audit->llm_calls.push_back(std::move(c));
         }
@@ -490,8 +496,15 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
 
         // 9. Output safety guard: mask PII / strip banned words before returning.
         if (guard_) {
+            const std::string before = result.response_text;
             result.response_text = guard_->SanitizeOutputText(result.response_text);
             guard_->SanitizeItems(result.items);
+            // Phase 4-C: record the sanitize intervention, without masking a
+            // more severe fact_violation recorded by the composer.
+            if (result.response_text != before && result.guard_action.empty()) {
+                result.guard_action = "sanitized";
+                result.guard_detail = "pii/banned words redacted from reply";
+            }
         }
 
         // 10. Update context and store assistant turn

@@ -1,0 +1,16 @@
+{
+  "_comment": "SafetyGuard 规则外置(Phase 4-C)。缺文件/损坏时 api_server 使用内置默认,内容与本文件一致(行为逐字节不变)。各数组整体替换内置列表;max_input_chars 为输入超长阈值。",
+  "max_input_chars": 500,
+  "injection_patterns": [
+    "ignore previous instructions", "ignore the above", "disregard the above",
+    "ignore all previous", "forget your instructions", "override your instructions",
+    "you are now", "new instructions:", "system prompt", "reveal your prompt",
+    "developer mode", "jailbreak", "dan mode", "act as ", "pretend you are",
+    "no restrictions", "without any restrictions",
+    "忽略之前的指令", "忽略以上", "无视上面的", "覆盖你的指令", "你现在的身份",
+    "你现在是", "扮演一个", "没有任何限制", "输出你的系统提示", "系统提示词",
+    "越狱", "解除限制"
+  ],
+  "banned_topics": ["赌博", "毒品", "色情", "枪支", "爆炸", "洗钱"],
+  "banned_output_words": ["赌博", "毒品", "色情"]
+}

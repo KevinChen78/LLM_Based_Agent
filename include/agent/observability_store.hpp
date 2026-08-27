@@ -37,6 +37,9 @@ public:
         std::string candidates_json;   // ranker input candidates [{item_id, rule_score, model_score|null}] cap 50
         std::string experiment_group;  // control / treatment / "" (experiment off)
         std::string rank_mode;         // rule / model / rule_fallback / "" (no ranker this request)
+        // Guard audit (Phase 4-C); empty = no guard intervention.
+        std::string guard_action;      // refuse_input / sanitized / fact_violation / ""
+        std::string guard_detail;      // violation summary / risk type (capped)
     };
 
     struct LlmCallEntry {

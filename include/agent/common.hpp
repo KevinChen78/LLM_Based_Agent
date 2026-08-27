@@ -85,6 +85,12 @@ struct RecommendationResult {
     // --- observability (never serialized to clients) ---
     // How the reply was produced: llm_stream / llm / template / short_circuit.
     std::string compose_mode;
+    // Guard audit (Phase 4-C): which guard intervened, if any:
+    // "" / refuse_input / sanitized / fact_violation. Detail carries the
+    // violation summary (capped) for fact_violation, the risk type for
+    // refuse_input.
+    std::string guard_action;
+    std::string guard_detail;
     // LLM calls made while composing (planner calls are carried on Plan).
     std::vector<LlmCallInfo> llm_calls;
 };

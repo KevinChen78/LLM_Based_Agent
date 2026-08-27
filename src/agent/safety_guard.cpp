@@ -3,7 +3,12 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <fstream>
 #include <regex>
+#include <sstream>
+
+#include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 namespace agent {
 
@@ -24,12 +29,10 @@ bool ContainsAny(const std::string& haystack, const std::vector<std::string>& ne
     return false;
 }
 
-} // namespace
-
-SafetyGuard::SafetyGuard() {
-    // Common prompt-injection / jailbreak tells (matched case-insensitively
-    // on the ASCII portion; Chinese phrases are matched verbatim).
-    injection_patterns_ = {
+// Built-in defaults. Kept as functions so the file-override path can fall
+// back to them per-key; the no-file behavior is byte-identical to Phase 0.
+std::vector<std::string> DefaultInjectionPatterns() {
+    return {
         "ignore previous instructions", "ignore the above", "disregard the above",
         "ignore all previous", "forget your instructions", "override your instructions",
         "you are now", "new instructions:", "system prompt", "reveal your prompt",
@@ -40,16 +43,77 @@ SafetyGuard::SafetyGuard() {
         "你现在是", "扮演一个", "没有任何限制", "输出你的系统提示", "系统提示词",
         "越狱", "解除限制",
     };
+}
 
-    // Illustrative banned topics for a group-buying recommendation agent.
-    banned_topics_ = {
-        "赌博", "毒品", "色情", "枪支", "爆炸", "洗钱",
-    };
+std::vector<std::string> DefaultBannedTopics() {
+    return {"赌博", "毒品", "色情", "枪支", "爆炸", "洗钱"};
+}
 
-    // Words redacted from the outgoing reply.
-    banned_output_words_ = {
-        "赌博", "毒品", "色情",
-    };
+std::vector<std::string> DefaultBannedOutputWords() {
+    return {"赌博", "毒品", "色情"};
+}
+
+std::string StripWords(const std::string& text, const std::vector<std::string>& words) {
+    std::string out = text;
+    // Replace each banned word with *** . Simple substring replace loop.
+    for (std::string::size_type pos = 0;;) {
+        std::string::size_type best = std::string::npos;
+        std::size_t blen = 0;
+        for (const auto& w : words) {
+            if (w.empty()) continue;
+            auto p = out.find(w, pos);
+            if (p != std::string::npos && (best == std::string::npos || p < best)) {
+                best = p;
+                blen = w.size();
+            }
+        }
+        if (best == std::string::npos) break;
+        out.replace(best, blen, "***");
+        pos = best + 3;  // advance past the replacement
+    }
+    return out;
+}
+
+} // namespace
+
+SafetyGuard::SafetyGuard(const std::string& rules_path) {
+    injection_patterns_ = DefaultInjectionPatterns();
+    banned_topics_ = DefaultBannedTopics();
+    banned_output_words_ = DefaultBannedOutputWords();
+
+    // Phase 4-C: optional rule file override. Missing file is the normal
+    // offline/default case (silent); a present-but-malformed file warns and
+    // keeps defaults. Present keys REPLACE the corresponding built-in list.
+    if (rules_path.empty()) return;
+    std::ifstream in(rules_path);
+    if (!in) return;  // no file -> built-in defaults
+    try {
+        std::stringstream ss;
+        ss << in.rdbuf();
+        const auto j = nlohmann::json::parse(ss.str());
+        auto load_list = [&j](const char* key, std::vector<std::string>& dst) {
+            if (j.contains(key) && j[key].is_array()) {
+                std::vector<std::string> v;
+                for (const auto& e : j[key]) {
+                    if (e.is_string()) v.push_back(e.get<std::string>());
+                }
+                dst = std::move(v);
+            }
+        };
+        load_list("injection_patterns", injection_patterns_);
+        load_list("banned_topics", banned_topics_);
+        load_list("banned_output_words", banned_output_words_);
+        if (j.contains("max_input_chars") && j["max_input_chars"].is_number_unsigned()) {
+            max_input_chars = j["max_input_chars"].get<std::size_t>();
+        }
+        spdlog::info("SafetyGuard: loaded rule overrides from {}", rules_path);
+    } catch (const std::exception& e) {
+        injection_patterns_ = DefaultInjectionPatterns();
+        banned_topics_ = DefaultBannedTopics();
+        banned_output_words_ = DefaultBannedOutputWords();
+        spdlog::warn("SafetyGuard: rules file {} malformed ({}), using built-in defaults.",
+                     rules_path, e.what());
+    }
 }
 
 InputGuardResult SafetyGuard::CheckInput(const std::string& user_message) const {
@@ -109,27 +173,11 @@ std::string SafetyGuard::MaskPii(const std::string& text) {
 }
 
 std::string SafetyGuard::StripBannedWords(const std::string& text) {
-    std::string out = text;
-    // Replace each banned word with *** . Simple substring replace loop.
-    for (std::string::size_type pos = 0;;) {
-        std::string::size_type best = std::string::npos;
-        std::size_t blen = 0;
-        for (const auto& w : {std::string("赌博"), std::string("毒品"), std::string("色情")}) {
-            auto p = out.find(w, pos);
-            if (p != std::string::npos && (best == std::string::npos || p < best)) {
-                best = p;
-                blen = w.size();
-            }
-        }
-        if (best == std::string::npos) break;
-        out.replace(best, blen, "***");
-        pos = best + 3;  // advance past the replacement
-    }
-    return out;
+    return StripWords(text, DefaultBannedOutputWords());
 }
 
 std::string SafetyGuard::SanitizeOutputText(const std::string& text) const {
-    return StripBannedWords(MaskPii(text));
+    return StripWords(MaskPii(text), banned_output_words_);
 }
 
 void SafetyGuard::SanitizeItems(std::vector<RecommendationItem>& items) const {

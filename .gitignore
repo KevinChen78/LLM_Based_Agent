@@ -10,7 +10,9 @@ build-grpc/
 CMakeSettings.json
 out/
 logs/
-data/
+data/*
+# Phase 4-C: hand-authored guard rule overrides (config, not generated data)
+!data/guard_rules.json
 ftp_root/
 .DS_Store
 *.log

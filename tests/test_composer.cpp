@@ -341,6 +341,9 @@ TEST(ResponseComposer, FactViolationFallsBackToTemplate) {
     // The LLM call is audited with the guard-fallback status.
     ASSERT_EQ(result.llm_calls.size(), 1u);
     EXPECT_EQ(result.llm_calls[0].status, "guard_fallback");
+    // Guard audit rides the observability channel (Phase 4-C).
+    EXPECT_EQ(result.guard_action, "fact_violation");
+    EXPECT_NE(result.guard_detail.find("99"), std::string::npos);
 }
 
 TEST(ResponseComposer, HonestPricePassesGuard) {
@@ -393,6 +396,7 @@ TEST(ResponseComposer, StreamingFactViolationEmitsReplace) {
     EXPECT_EQ(result.response_text.find("99"), std::string::npos);
     ASSERT_EQ(result.llm_calls.size(), 1u);
     EXPECT_EQ(result.llm_calls[0].status, "guard_fallback");
+    EXPECT_EQ(result.guard_action, "fact_violation");
 }
 
 TEST(ResponseComposer, StreamingHonestReplyPassesGuardWithoutReplace) {
