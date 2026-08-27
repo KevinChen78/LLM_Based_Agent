@@ -1,4 +1,4 @@
-# LLM-based 团购推荐 Agent —— Phase 0 工程
+# LLM-based 团购推荐 Agent
 
 ## 目录说明
 
@@ -10,17 +10,18 @@ LLM_Based_Agent/
 ├── src/                 # 核心实现
 │   ├── agent/           # 编排层
 │   ├── llm/             # LLM 客户端 / Prompt 构建
-│   ├── tools/           # Mock 工具
+│   ├── tools/           # 工具实现（DealRetriever/DealRanker/KnowledgeRetriever + 客户端）
 │   └── memory/          # 会话记忆
-├── llm_gateway/         # Python Mock LLM Gateway
-├── retrieval_service/   # Python 检索服务（PostgreSQL 存储 + SQL 过滤下推 + BM25 排序）
+├── llm_gateway/         # Python LLM 网关（确定性 stub / OpenAI 兼容透传）
+├── retrieval_service/   # Python 检索服务（PostgreSQL 存储 + SQL 过滤下推 + BM25/向量 RRF + gRPC 双协议）
+├── ranking_service/     # Python 学习式排序服务（LightGBM，Phase 2.1）
 ├── sql/                 # PostgreSQL DDL 与初始化走查
 ├── tests/               # 单元测试
 ├── proto/               # gRPC/Protobuf 定义
 ├── configs/             # 配置文件
 ├── cmake/               # CMake 依赖管理
-├── requirements.txt     # Python 依赖（psycopg，仅检索服务 postgres 后端需要）
-└── docs/                # 构建指南
+├── requirements.txt     # Python 依赖（psycopg+fastembed 仅检索服务;lightgbm 仅排序服务;grpcio 仅检索 gRPC 前端）
+└── docs/                # 构建指南 + 各阶段收口文档 + 面试材料
 ```
 
 ## 依赖
@@ -47,23 +48,27 @@ cd LLM_Based_Agent
 ./scripts/build_phase0.sh
 ```
 
-> 当前环境缺少 C++ 编译器和 CMake，请先参考 [docs/Windows构建指南.md](docs/Windows构建指南.md)。
+（Windows 构建环境配置参考 [docs/Windows构建指南.md](docs/Windows构建指南.md)。）
 
 ## 运行
 
-控制平面（C++ `api_server`，:8080）通过 HTTP 调用数据平面（Python `llm_gateway`，:8000）。
-**两个进程都要启动**，否则 C++ 端会降级为 `FALLBACK`。
+最小闭环只需控制平面（C++ `api_server`，:8080）一个进程——`LLM_BASE_URL`/
+`RETRIEVAL_SERVICE_URL` 为空时自动降级为内置 stub + 本地目录检索，可离线演示。
+完整形态是**四进程**:`api_server`(:8080)+ `llm_gateway`(:8000)+
+`retrieval_service`(:8001)+ `ranking_service`(:8002,Phase 2.1,可选)。
 
 ### Windows（已验证）
 
 ```powershell
-# 1. 启动 Python LLM Gateway（数据平面）
-python llm_gateway/main.py
-# 或带 -u 实时查看日志：
-python -u llm_gateway/main.py
+# 一键起全栈:retrieval_service(:8001) + llm_gateway(:8000)
+#   + ranking_service(:8002) + api_server(:8080,Web UI 在 /)
+.\start_all.bat
 
-# 2. 另开终端启动 C++ API Server（控制平面）
-.\build\bin\Release\api_server.exe
+# 或分进程手动起:
+python -u llm_gateway/main.py                          # 1. LLM 网关
+python -u retrieval_service/main.py                    # 2. 检索服务
+python -u ranking_service/main.py                      # 3. 排序服务(可选)
+.\build\bin\Release\api_server.exe                     # 4. 控制平面
 ```
 
 ### Linux / macOS / MSYS2
@@ -91,13 +96,15 @@ curl -s -X POST http://localhost:8080/v1/chat \
 多轮对话 e2e 回归（脚本自动起停 api_server，临时 SQLite 库，纯 stdlib）：
 
 ```bash
-python scripts/e2e_multi_turn.py          # 离线确定性：内置 stub，34 项断言
-python scripts/e2e_multi_turn.py --real   # 真实 LLM：需 gateway 配好 LLM_API_KEY
+python scripts/e2e_multi_turn.py          # 离线确定性：内置 stub，80 项断言
+python scripts/e2e_multi_turn.py --real   # 真实 LLM：需 gateway 配好 LLM_API_KEY，7 项语义检查
 ```
 
 覆盖：追问→补全→推荐多轮主链路、反馈落库（👍/👎 → feedback 表 + FK 拒绝）、
-SSE 事件序列、SQLite turns/context 直读校验、重启后同库续聊、会话内安全护栏、观测落库（7 请求 7 行审计 + metrics 聚合）；`--real` 额外验证语义级槽位延续（只补预算时
-不再追问城市/人数）与知识问题 kb_search grounding。
+SSE 事件序列、SQLite turns/context 直读校验、重启后同库续聊、会话内安全护栏、
+观测落库（审计行数 + metrics 聚合）、API key 鉴权（S7 独立实例）、限流（S8 独立实例）、
+输入护栏 payload 注入/违禁拦截（S9,含 guard_action 落库断言）；`--real` 额外验证
+语义级槽位延续（只补预算时不再追问城市/人数）与知识问题 kb_search grounding。
 
 ## 接入真实 LLM
 
@@ -122,7 +129,7 @@ python -u llm_gateway/main.py
 `LLM_MODEL` 覆盖，避免上游收到未知模型名而 400。
 
 > 验证真模型（而非 stub 兜底）的方法：发一条 stub 无法匹配的查询，如「火锅/北京/4人/500」。
-> stub 对含「吃/想」的输入只会 clarify；真模型会正确解析为 `mock_retriever(category=火锅,city=北京,...)`。
+> stub 对含「吃/想」的输入只会 clarify；真模型会正确解析为 `deal_retriever(category=火锅,city=北京,...)`。
 
 上游不可用时网关自动回退到确定性 stub，不会让整条链路失败。
 
@@ -132,7 +139,7 @@ python -u llm_gateway/main.py
 与 API 同源托管，浏览器打开即用：
 
 ```powershell
-# 照常起三进程（web/ 由 api_server 自动托管，可用 WEB_DIR 覆盖）
+# 照常起栈（web/ 由 api_server 自动托管，可用 WEB_DIR 覆盖）;一键方式见 start_all.bat
 python retrieval_service/main.py
 python llm_gateway/main.py
 $env:RETRIEVAL_SERVICE_URL="http://localhost:8001"
@@ -169,13 +176,13 @@ $env:LLM_BASE_URL=""          # Windows
 ./build/bin/Release/api_server.exe
 ```
 
-## Phase 0 边界
+## 进程边界与降级链
 
 - `HttpLlmClient`：`base_url` 非空时走 HTTP 调用 LLM Gateway（默认 `http://localhost:8000`）；为空则降级为内置确定性 Stub。默认超时 45s（适配推理模型）。
 - `llm_gateway`：未配置 `LLM_API_KEY` 时为确定性 stub；配置后透传到真实 OpenAI-compatible LLM，并对后端模型名做权威覆盖。
-- 召回/排序默认使用**真实目录后端**（`DealRetriever` + `DealRanker`，读 `data/deals.json`，缺失时用内置兜底数据集）；设 `RETRIEVAL_SERVICE_URL` 后文本相关性升级为检索服务的 BM25（见下文 RAG 章节）。
+- 召回/排序默认使用**真实目录后端**（`DealRetriever` + `DealRanker`，读 `data/deals.json`，缺失时用内置兜底数据集）；设 `RETRIEVAL_SERVICE_URL` 后文本相关性升级为检索服务的 BM25+向量 RRF（见下文 RAG 章节）；设 `RANKER_SERVICE_URL` + `RANKER_MODE` 后排序可升级为 LightGBM 模型分（挂/无模型自动回退规则分）。
 - 会话记忆默认为 **SQLite** 持久化实现（`SqliteSessionStore`），支持跨进程重启保持会话；可用 `SESSION_STORE=memory` 切回内存实现。
-- gRPC/Protobuf 仅保留定义文件，Phase 0 先通过 HTTP JSON 通信。
+- gRPC/Protobuf:retrieval_service 已试点双协议并存（Phase 5，见下文专节），其余进程间仍走 HTTP JSON。
 
 ## 会话持久化（SQLite）
 
