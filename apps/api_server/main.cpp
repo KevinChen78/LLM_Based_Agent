@@ -10,6 +10,7 @@
 #include "agent/deal_tools.hpp"
 #include "agent/llm_client.hpp"
 #include "agent/observability_store.hpp"
+#include "agent/rate_limiter.hpp"
 #include "agent/response_composer.hpp"
 #include "agent/retrieval_client.hpp"
 #include "agent/safety_guard.hpp"
@@ -27,6 +28,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <fstream>
 #include <iostream>
@@ -269,15 +271,47 @@ int main() {
     std::cout << "API auth: " << (api_auth.Enabled() ? "enabled (AGENT_API_KEYS)"
                                                      : "disabled (set AGENT_API_KEYS to enable)")
               << std::endl;
+    // Per-user token-bucket rate limit (Phase 5-B). RATE_LIMIT_RPS/
+    // RATE_LIMIT_BURST empty or 0 => unlimited, byte-identical to before.
+    // Counted once per request at handler entry; SSE streams are not charged
+    // by connection duration.
+    RateLimiter rate_limiter = RateLimiter::FromEnv();
+    if (rate_limiter.Enabled()) {
+        std::cout << "Rate limit: " << rate_limiter.rps() << " rps, burst "
+                  << rate_limiter.burst() << " per user" << std::endl;
+    } else {
+        std::cout << "Rate limit: disabled (set RATE_LIMIT_RPS/RATE_LIMIT_BURST to enable)" << std::endl;
+    }
+    std::atomic<long long> auth_rejected{0};
+    std::atomic<long long> rate_limited{0};
     // Reject helper: shared 401 shape for all protected endpoints.
-    auto require_auth = [&api_auth](const Request& req, Response& resp) -> bool {
+    auto require_auth = [&api_auth, &auth_rejected](const Request& req, Response& resp) -> bool {
         if (api_auth.Check(req.header("X-Api-Key"))) return true;
+        ++auth_rejected;
         static std::atomic<int> auth_counter{0};
         auto now = std::chrono::system_clock::now().time_since_epoch().count();
         resp.status(coro::net::http::Status::Unauthorized)
             .json(json{{"error", "missing or invalid API key"},
                        {"trace_id", "t-" + std::to_string(now) + "-auth" +
                                         std::to_string(++auth_counter)}}.dump());
+        return false;
+    };
+    // Rate-limit identity: user_id first, then API key, then a shared
+    // fallback bucket (coro does not expose the peer address).
+    auto require_quota = [&rate_limiter, &rate_limited](
+            const std::string& user_id, const Request& req, Response& resp) -> bool {
+        std::string key = !user_id.empty() ? "u:" + user_id
+            : !req.header("X-Api-Key").empty() ? "k:" + req.header("X-Api-Key")
+            : "anonymous";
+        double retry = 0.0;
+        if (rate_limiter.Allow(key, &retry)) return true;
+        ++rate_limited;
+        auto now = std::chrono::system_clock::now().time_since_epoch().count();
+        resp.status(coro::net::http::Status::TooManyRequests)
+            .header("Retry-After", std::to_string(static_cast<int>(std::ceil(retry))))
+            .json(json{{"error", "rate limit exceeded"},
+                       {"retry_after_seconds", retry},
+                       {"trace_id", "t-" + std::to_string(now) + "-rl"}}.dump());
         return false;
     };
 
@@ -296,12 +330,13 @@ int main() {
     Server server(pool, static_cast<uint16_t>(port));
 
     server
-        .post("/v1/chat", [orchestrator, require_auth](const Request& req, Response& resp) -> Task<void> {
+        .post("/v1/chat", [orchestrator, require_auth, require_quota](const Request& req, Response& resp) -> Task<void> {
             if (!require_auth(req, resp)) co_return;
             try {
                 auto body = json::parse(req.body());
                 UserContext ctx;
                 ctx.user_id = body.value("user_id", "");
+                if (!require_quota(ctx.user_id, req, resp)) co_return;
                 ctx.session_id = body.value("session_id", "");
                 ctx.city = body.value("city", "");
                 ctx.longitude = body.value("longitude", 0.0);
@@ -322,12 +357,13 @@ int main() {
             }
             co_return;
         })
-        .post("/v1/chat/stream", [orchestrator, require_auth](const Request& req, Response& resp) -> Task<void> {
+        .post("/v1/chat/stream", [orchestrator, require_auth, require_quota](const Request& req, Response& resp) -> Task<void> {
             if (!require_auth(req, resp)) co_return;
             try {
                 auto body = json::parse(req.body());
                 UserContext ctx;
                 ctx.user_id = body.value("user_id", "");
+                if (!require_quota(ctx.user_id, req, resp)) co_return;
                 ctx.session_id = body.value("session_id", "");
                 ctx.city = body.value("city", "");
                 ctx.longitude = body.value("longitude", 0.0);
@@ -364,10 +400,11 @@ int main() {
             }
             co_return;
         })
-        .post("/v1/feedback", [memory, require_auth](const Request& req, Response& resp) -> Task<void> {
+        .post("/v1/feedback", [memory, require_auth, require_quota](const Request& req, Response& resp) -> Task<void> {
             if (!require_auth(req, resp)) co_return;
             try {
                 auto body = json::parse(req.body());
+                if (!require_quota(body.value("user_id", ""), req, resp)) co_return;
                 SessionMemoryStore::FeedbackRecord rec;
                 rec.session_id = body.value("session_id", "");
                 rec.trace_id = body.value("trace_id", "");
@@ -405,10 +442,15 @@ int main() {
             resp.json(json{{"status", "ok"}}.dump());
             co_return;
         })
-        .get("/v1/metrics", [obs, sessions_db_path, require_auth](const Request& req, Response& resp) -> Task<void> {
+        .get("/v1/metrics", [obs, sessions_db_path, require_auth, require_quota,
+                             &auth_rejected, &rate_limited](const Request& req, Response& resp) -> Task<void> {
             if (!require_auth(req, resp)) co_return;
+            if (!require_quota("", req, resp)) co_return;
             try {
-                resp.json(obs->Aggregate(sessions_db_path).dump());
+                auto m = obs->Aggregate(sessions_db_path);
+                m["api_guard"] = {{"auth_rejected", auth_rejected.load()},
+                                  {"rate_limited", rate_limited.load()}};
+                resp.json(m.dump());
             } catch (const std::exception& e) {
                 spdlog::error("Error handling /v1/metrics: {}", e.what());
                 resp.status(coro::net::http::Status::InternalServerError)

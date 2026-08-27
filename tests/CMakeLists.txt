@@ -13,6 +13,7 @@ add_executable(test_agent
     test_user_profile.cpp
     test_category_vocab.cpp
     test_api_auth.cpp
+    test_rate_limiter.cpp
 )
 
 target_link_libraries(test_agent PRIVATE

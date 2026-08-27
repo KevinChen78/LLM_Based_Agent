@@ -204,6 +204,8 @@ def start_api_server(db_path, log_path, llm_base_url="", retrieval_url="",
     # Pin auth/rate-limit off so a developer's exported env can never leak
     # into the regression; the auth tier re-enables them via extra_env.
     env["AGENT_API_KEYS"] = ""
+    env["RATE_LIMIT_RPS"] = ""
+    env["RATE_LIMIT_BURST"] = ""
     if obs_db_path:
         env["OBS_DB_PATH"] = obs_db_path
     if extra_env:
@@ -469,7 +471,61 @@ def scenario_s7_auth(tmp, procs):
     check("S7.static_exempt", status == 200, f"got {status}")
 
 
+def scenario_s8_ratelimit(tmp, procs):
+    """Phase 5-B: per-user token bucket on a third instance (port 8082).
+
+    RATE_LIMIT_RPS=2, RATE_LIMIT_BURST=2: a fast burst of 6 requests must hit
+    429 with a Retry-After header; after waiting for a refill the same user
+    passes again. /v1/metrics (different bucket: no user_id) stays readable
+    and reports the rate_limited counter.
+    """
+    section("S8 限流(独立实例 :8082)")
+    if port_open(8082):
+        raise RuntimeError("port 8082 is already in use (rate-limit tier needs it)")
+    base = "http://127.0.0.1:8082"
+    proc, log = start_api_server(
+        os.path.join(tmp, "rl.db"), os.path.join(tmp, "api_rl.log"),
+        obs_db_path=os.path.join(tmp, "rl_obs.db"),
+        port=8082, extra_env={"RATE_LIMIT_RPS": "2", "RATE_LIMIT_BURST": "2"})
+    procs.append((proc, log))
+
+    payload = {"user_id": "e2e-rl", "message": "我想吃海鲜"}
+
+    def raw_post():
+        """Returns (status, headers, body) — Retry-After lives in headers."""
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            f"{base}/v1/chat", data=data,
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.status, resp.headers, resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, e.read().decode("utf-8")
+
+    results = [raw_post() for _ in range(6)]
+    codes = [r[0] for r in results]
+    check("S8.burst_has_429", codes.count(429) >= 3, str(codes))
+    check("S8.burst_first_ok", codes[0] == 200, str(codes))
+    r429 = next(r for r in results if r[0] == 429)
+    check("S8.retry_after_header", r429[1].get("Retry-After") is not None,
+          str(dict(r429[1])))
+    check("S8.body_mentions_limit", "rate limit" in r429[2], r429[2][:120])
+
+    time.sleep(1.2)  # 2 rps => >2 tokens refilled
+    status, _, _ = raw_post()
+    check("S8.recovers_after_refill", status == 200, f"got {status}")
+
+    # /v1/metrics uses a different bucket (no user_id) and reports counters.
+    status, m = get_status(f"{base}/v1/metrics")
+    check("S8.metrics_readable", status == 200, f"got {status}")
+    guard = m.get("api_guard", {}) if isinstance(m, dict) else {}
+    check("S8.metrics_rate_limited_count",
+          guard.get("rate_limited", 0) >= 3, str(guard))
+
+
 def scenario_s6_observability(obs_db):
+
     """Audit trail: one rec_logs row per request, llm_calls per LLM call,
     and the /v1/metrics aggregate (feedback joined via ATTACH)."""
     section("S6 观测落库（recommendation_logs / llm_calls / metrics）")
@@ -615,6 +671,7 @@ def main():
             scenario_s4_guard(db_path, sid)
             scenario_s6_observability(obs_db)
             scenario_s7_auth(tmp, procs)
+            scenario_s8_ratelimit(tmp, procs)
         else:
             # Real tier: gateway must be up with a key; reuse or start it.
             gw_health = None
