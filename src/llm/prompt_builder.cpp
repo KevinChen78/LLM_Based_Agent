@@ -44,10 +44,19 @@ std::string PromptBuilder::TaskPlanningPrompt(
     const std::string& current_slots_json,
     const std::string& user_profile_json,
     const std::string& category_list) {
-    // The category slot rule tightens once the real vocabulary is known.
-    const std::string category_rule = category_list.empty()
-        ? "- category：类目。如 海鲜、火锅、日料、烧烤。"
-        : "- category：类目。只能从下方「有效类目列表」中原样取值；列表中没有匹配的，category 留空。";
+    // The category slot rule tightens once the real vocabulary is known —
+    // and rule 1 must stop demanding category, otherwise "leave category
+    // empty and use keywords" would always dead-end in a clarify loop.
+    const bool has_list = !category_list.empty();
+    const std::string category_rule = has_list
+        ? "- category：类目。只能从下方「有效类目列表」中原样取值；列表中没有匹配的，category 留空。"
+        : "- category：类目。如 海鲜、火锅、日料、烧烤。";
+    const std::string clarify_rule = has_list
+        ? "1. 如果 city 或 budget 缺失或置信度低，必须进入追问（action = \"clarify\"）。"
+          "category 无法从有效类目列表取值时按上述规则留空（需求词进 keywords），不因此追问。"
+          "用户明确表示预算/人数「没有要求」「不限」「都行」时，视为该槽位不设约束"
+          "（budget=0、people=0），信息足够，直接 retrieve，不要追问。"
+        : "1. 如果 city、category、budget 中任意一项缺失或置信度低，必须进入追问（action = \"clarify\"）。";
     return R"(# Role
 你是“团购推荐 Agent”的任务规划器。你的职责是：
 1. 理解用户当前输入；
@@ -66,7 +75,7 @@ std::string PromptBuilder::TaskPlanningPrompt(
 - taboo：禁忌/不喜欢的。如 不吃辣、海鲜过敏。
 )" + CategoryListSection(category_list) + R"(
 # 关键规则
-1. 如果 city、category、budget 中任意一项缺失或置信度低，必须进入追问（action = "clarify"）。
+)" + clarify_rule + R"(
 2. 如果信息足够，action = "retrieve"，并生成 deal_retriever 工具调用。
 3. 召回之后若用户有明确预算/人数/禁忌，可再追加一个 deal_ranker 工具调用做精排
    （candidates 留空，系统会自动注入上一步召回结果）。

@@ -213,6 +213,64 @@ TEST(DealRetrieverBm25, NoRecallAuditWhenAbsent) {
     EXPECT_FALSE(out.contains("recall_audit"));
 }
 
+TEST(DealRetrieverBm25, NullArgsTolerated) {
+    // Phase 3-D replay finding: the LLM emits explicit nulls ("max_price":
+    // null when the user states no budget). value<>() throws on null and the
+    // whole tool call failed — nulls must read as absent.
+    auto catalog = std::make_shared<DealCatalog>("");
+    auto client = std::make_shared<FakeRetrievalClient>();
+    client->deals_response = json{
+        {"total", 2},
+        {"items", json::array({
+            {{"item_id","gb-1"},{"title","粤式早茶点心"},{"city","深圳"},
+             {"price",168.0},{"rating",4.5},{"sold_count",300},{"score",6.1}}
+        })}
+    };
+    DealRetriever retriever(catalog, client);
+
+    auto result = retriever.Execute(MakeCall("deal_retriever", {
+        {"city","深圳"},{"category",nullptr},{"keywords","早茶"},
+        {"max_price",nullptr},{"min_price",nullptr},{"people",nullptr},
+        {"top_k",nullptr}
+    })).result();
+
+    ASSERT_TRUE(result.success) << result.error_message;
+    // Nulls became "absent": nothing but query/city reached the service.
+    EXPECT_EQ(client->last_filters["city"], "深圳");
+    EXPECT_EQ(client->last_filters["query"], "早茶");
+    EXPECT_FALSE(client->last_filters.contains("max_price"));
+    EXPECT_FALSE(client->last_filters.contains("category"));
+    auto out = json::parse(result.result_json);
+    ASSERT_EQ(out["items"].size(), 1u);
+}
+
+TEST(DealRetrieverBm25, ZeroMaxPriceMeansNoLimit) {
+    // Phase 3-D replay finding: the planner translates "预算没有要求" into
+    // budget=0 and forwards max_price=0. The retrieval service's max_price=0
+    // semantics deliberately filter everything (price <= 0), so the tool must
+    // normalize a non-positive ceiling to "no limit" before calling out.
+    auto catalog = std::make_shared<DealCatalog>("");
+    auto client = std::make_shared<FakeRetrievalClient>();
+    client->deals_response = json{
+        {"total", 2},
+        {"items", json::array({
+            {{"item_id","gb-1"},{"title","粤式早茶点心"},{"city","深圳"},
+             {"price",168.0},{"rating",4.5},{"sold_count",300},{"score",6.1}}
+        })}
+    };
+    DealRetriever retriever(catalog, client);
+
+    auto result = retriever.Execute(MakeCall("deal_retriever", {
+        {"city","深圳"},{"keywords","早茶"},{"max_price",0},{"people",2}
+    })).result();
+
+    ASSERT_TRUE(result.success) << result.error_message;
+    // max_price=0 must NOT reach the service as a filter.
+    EXPECT_FALSE(client->last_filters.contains("max_price"));
+    auto out = json::parse(result.result_json);
+    ASSERT_EQ(out["items"].size(), 1u);
+}
+
 TEST(DealRetrieverBm25, NoClientUsesLocalOnly) {
     auto catalog = std::make_shared<DealCatalog>("");
     DealRetriever retriever(catalog);   // no retrieval client injected

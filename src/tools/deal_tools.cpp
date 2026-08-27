@@ -73,6 +73,26 @@ std::string BuildReason(const nlohmann::json& deal) {
     return s;
 }
 
+// LLM-emitted tool arguments occasionally carry explicit nulls (e.g.
+// "max_price": null when the user states no budget requirement) — nlohmann's
+// value() throws type_error on those and fails the whole tool call. Treat
+// null / type-mismatched values as absent instead (Phase 3-D replay finding).
+std::string ArgStr(const nlohmann::json& args, const char* key,
+                   const std::string& dflt = "") {
+    if (!args.contains(key) || !args[key].is_string()) return dflt;
+    return args[key].get<std::string>();
+}
+
+double ArgNum(const nlohmann::json& args, const char* key, double dflt) {
+    if (!args.contains(key) || !args[key].is_number()) return dflt;
+    return args[key].get<double>();
+}
+
+int ArgInt(const nlohmann::json& args, const char* key, int dflt) {
+    if (!args.contains(key) || !args[key].is_number()) return dflt;
+    return args[key].get<int>();
+}
+
 // Tokenize keyword list and count how many tokens match the deal's searchable text.
 // Returns {matched, total}. If keywords empty, total==0 (neutral).
 std::pair<int, int> KeywordMatch(const nlohmann::json& deal,
@@ -143,14 +163,18 @@ coro::Task<ToolResult> DealRetriever::Execute(const ToolCall& call) {
 
     try {
         auto args = nlohmann::json::parse(call.arguments_json);
-        std::string city = args.value("city", "");
-        std::string category = args.value("category", "");
-        std::string district = args.value("district", "");
-        double max_price = args.value("max_price", 1e9);
-        double min_price = args.value("min_price", 0.0);
-        int people = args.value("people", 0);
-        std::string keywords = args.value("keywords", "");
-        int top_k = args.value("top_k", 20);
+        std::string city = ArgStr(args, "city");
+        std::string category = ArgStr(args, "category");
+        std::string district = ArgStr(args, "district");
+        double max_price = ArgNum(args, "max_price", 1e9);
+        double min_price = ArgNum(args, "min_price", 0.0);
+        // The planner emits max_price=0 for "budget 没有要求" — a zero ceiling
+        // is never a real constraint (and the service's max_price=0 semantics
+        // deliberately filter everything). Normalize to "no limit" here.
+        if (max_price <= 0.0) max_price = 1e9;
+        int people = ArgInt(args, "people", 0);
+        std::string keywords = ArgStr(args, "keywords");
+        int top_k = ArgInt(args, "top_k", 20);
         if (top_k <= 0) top_k = 20;
 
         // Optional BM25 semantic retrieval via the retrieval service. When the
@@ -301,18 +325,19 @@ coro::Task<ToolResult> DealRanker::Execute(const ToolCall& call) {
 
     try {
         auto args = nlohmann::json::parse(call.arguments_json);
-        auto candidates = args.value("candidates", nlohmann::json::array());
-        double budget = args.value("budget", 0.0);
-        int top_n = args.value("top_n", 3);
+        auto candidates = (args.contains("candidates") && args["candidates"].is_array())
+            ? args["candidates"] : nlohmann::json::array();
+        double budget = ArgNum(args, "budget", 0.0);
+        int top_n = ArgInt(args, "top_n", 3);
         if (top_n <= 0) top_n = 3;
-        std::string taboo = args.value("taboo", "");
+        std::string taboo = ArgStr(args, "taboo");
         auto taboo_tokens = Tokenize(taboo);
         // Injected by the orchestrator (not part of the LLM-visible schema):
         // user_id drives experiment bucketing; city/category feed the model's
         // context-cross features.
-        const std::string user_id = args.value("user_id", "");
-        const std::string ctx_city = args.value("city", "");
-        const std::string ctx_category = args.value("category", "");
+        const std::string user_id = ArgStr(args, "user_id");
+        const std::string ctx_city = ArgStr(args, "city");
+        const std::string ctx_category = ArgStr(args, "category");
 
         // Optional taboo filtering. Always local, always before any model
         // call — safety semantics are never delegated to the ranker service.
@@ -364,7 +389,7 @@ coro::Task<ToolResult> DealRanker::Execute(const ToolCall& call) {
             nlohmann::json req = {
                 {"candidates", model_candidates},
                 {"context", {{"budget", budget},
-                             {"people", args.value("people", 0)},
+                             {"people", ArgInt(args, "people", 0)},
                              {"city", ctx_city},
                              {"category", ctx_category},
                              {"user_id", user_id}}},
@@ -487,8 +512,8 @@ coro::Task<ToolResult> KnowledgeRetriever::Execute(const ToolCall& call) {
 
     try {
         auto args = nlohmann::json::parse(call.arguments_json);
-        std::string query = args.value("query", "");
-        int top_k = args.value("top_k", 3);
+        std::string query = ArgStr(args, "query");
+        int top_k = ArgInt(args, "top_k", 3);
         if (top_k <= 0) top_k = 3;
 
         if (!retrieval_ || !retrieval_->Enabled()) {

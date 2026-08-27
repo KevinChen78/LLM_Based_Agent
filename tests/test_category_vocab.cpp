@@ -51,6 +51,12 @@ TEST(CategoryVocabPrompt, ListInjectsSectionAndTightensRule) {
     EXPECT_NE(prompt.find("把用户原词写进 keywords"), std::string::npos);
     // The old free-text example rule is gone.
     EXPECT_EQ(prompt.find("category：类目。如"), std::string::npos);
+    // Rule 1 no longer demands category — otherwise "category 留空 + keywords"
+    // would dead-end in a clarify loop (observed in the Phase 3-D replay).
+    EXPECT_NE(prompt.find("city 或 budget 缺失"), std::string::npos);
+    EXPECT_NE(prompt.find("不因此追问"), std::string::npos);
+    EXPECT_EQ(prompt.find("city、category、budget 中任意一项缺失"),
+              std::string::npos);
     // Section sits inside the prompt before 关键规则.
     const auto sec = prompt.find("有效类目列表");
     const auto rules = prompt.find("# 关键规则");
