@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <regex>
 
 namespace agent {
@@ -139,6 +140,91 @@ void SafetyGuard::SanitizeItems(std::vector<RecommendationItem>& items) const {
             tag = SanitizeOutputText(tag);
         }
     }
+}
+
+namespace {
+
+bool Nearly(double a, double b, double eps) { return std::abs(a - b) <= eps; }
+
+// A money claim (¥xx / xx元) is legit when it matches, for some candidate
+// item: the exact price or original_price; or a derived figure — per-person
+// price/p or total price*p for p within the item's own [min_people,
+// max_people] span (capped at 1..20). Derived whitelist exists so honest
+// phrasing like 人均96元 / 四人共1152元 is not killed.
+bool MoneyAllowed(double v, const std::vector<RecommendationItem>& items) {
+    for (const auto& it : items) {
+        if (Nearly(v, it.price, 0.01) ||
+            (it.original_price > 0 && Nearly(v, it.original_price, 0.01))) {
+            return true;
+        }
+        int lo = it.min_people > 0 ? it.min_people : 1;
+        int hi = it.max_people > 0 ? it.max_people : 0;
+        if (hi < lo) continue;
+        hi = std::min(hi, 20);
+        for (int p = lo; p <= hi; ++p) {
+            const double total = it.price * p;
+            if (Nearly(v, total, 0.51)) return true;
+            const double per = it.price / p;
+            // 人均 claims round to an integer in either direction.
+            if (Nearly(v, std::floor(per), 0.51) ||
+                Nearly(v, std::ceil(per), 0.51)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// A discount claim (xx折) is legit when some item's actual discount
+// price/original_price*10 rounds to it (±0.5折 tolerance for phrasing).
+bool DiscountAllowed(double zhe, const std::vector<RecommendationItem>& items) {
+    for (const auto& it : items) {
+        if (it.original_price <= 0) continue;
+        const double actual = it.price * 10.0 / it.original_price;
+        if (Nearly(zhe, actual, 0.51)) return true;
+        // Or the claim derives a listed price: price == original * zhe / 10.
+        if (Nearly(it.price, it.original_price * zhe / 10.0, 0.51)) return true;
+    }
+    return false;
+}
+
+} // namespace
+
+FactCheckResult SafetyGuard::FactCheckReply(
+    const std::string& reply,
+    const std::vector<RecommendationItem>& items) const {
+    FactCheckResult r;
+    if (reply.empty()) return r;
+
+    auto add_violation = [&r](const std::string& what) {
+        r.ok = false;
+        r.violations.push_back(what);
+    };
+
+    // ¥xx / xx元 — money claims. Matched on UTF-8 bytes (source is /utf-8).
+    static const std::regex kMoney(R"((?:¥\s*(\d+(?:\.\d+)?))|(?:(\d+(?:\.\d+)?)\s*元))");
+    for (std::sregex_iterator m(reply.begin(), reply.end(), kMoney), end;
+         m != end; ++m) {
+        const std::string num = (*m)[1].matched ? (*m)[1].str() : (*m)[2].str();
+        const double v = std::stod(num);
+        if (!MoneyAllowed(v, items)) {
+            add_violation("money claim " + num + " not in candidate "
+                          "price/original_price/derived set");
+        }
+    }
+
+    // xx折 — discount claims.
+    static const std::regex kDiscount(R"((\d+(?:\.\d+)?)\s*折)");
+    for (std::sregex_iterator m(reply.begin(), reply.end(), kDiscount), end;
+         m != end; ++m) {
+        const double zhe = std::stod((*m)[1].str());
+        if (!DiscountAllowed(zhe, items)) {
+            add_violation("discount claim " + (*m)[1].str() +
+                          "折 not derivable from candidate prices");
+        }
+    }
+
+    return r;
 }
 
 } // namespace agent

@@ -283,8 +283,8 @@ int main() {
     } else {
         std::cout << "User profiles: disabled (SESSION_STORE=memory)" << std::endl;
     }
-    auto composer = std::make_shared<ResponseComposer>(llm);
     auto guard = std::make_shared<SafetyGuard>();
+    auto composer = std::make_shared<ResponseComposer>(llm, guard);
     auto orchestrator = std::make_shared<AgentOrchestrator>(
         planner, tools, memory, llm, composer, guard, obs, profiles, catalog);
 

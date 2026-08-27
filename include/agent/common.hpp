@@ -48,6 +48,8 @@ struct RecommendationItem {
     double score = 0.0;               // 排序得分（归一化到 0~1）
     long sold_count = 0;              // 销量，排序因子之一
     double rating = 0.0;              // 评分（0~5），排序因子之一
+    int min_people = 0;               // 套餐适用人数下限（0 = 未知）
+    int max_people = 0;               // 上限（0 = 未知）；事实校验派生白名单用
     std::string reason;
 };
 

@@ -17,6 +17,14 @@ struct InputGuardResult {
     std::string refusal_reply;
 };
 
+// Result of the output fact check (Phase 4-A).
+struct FactCheckResult {
+    bool ok = true;
+    // One entry per unmatched money/discount claim, e.g.
+    // "99元 not in {price/original_price/derived per-person,total}".
+    std::vector<std::string> violations;
+};
+
 // Phase 0 I/O safety guard.
 //
 // Rule-based and deterministic on purpose: no extra LLM call, no latency,
@@ -43,6 +51,16 @@ public:
 
     // Sanitize the final reply text (PII mask + banned-word strip).
     std::string SanitizeOutputText(const std::string& text) const;
+
+    // Phase 4-A: fact-check a composed reply against the candidate items.
+    // Extracts money/discount claims (¥xx, xx元, xx折) and verifies each
+    // against the items' price/original_price, plus a derived whitelist:
+    // per-person (price/people) and total (price*people) for people in the
+    // item's own [min_people, max_people] range, and zhe-level discounts
+    // (price/original_price*10). Rule-based, zero LLM calls.
+    FactCheckResult FactCheckReply(
+        const std::string& reply,
+        const std::vector<RecommendationItem>& items) const;
 
     // Sanitize each item's reason / title in place.
     void SanitizeItems(std::vector<RecommendationItem>& items) const;

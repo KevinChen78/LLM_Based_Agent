@@ -110,8 +110,9 @@ std::optional<std::string> TryParseComposition(const std::string& raw,
 
 } // namespace
 
-ResponseComposer::ResponseComposer(std::shared_ptr<LlmClient> llm)
-    : llm_(std::move(llm)) {}
+ResponseComposer::ResponseComposer(std::shared_ptr<LlmClient> llm,
+                                   std::shared_ptr<const SafetyGuard> guard)
+    : llm_(std::move(llm)), guard_(std::move(guard)) {}
 
 coro::Task<RecommendationResult> ResponseComposer::Compose(
     const std::string& user_request,
@@ -214,6 +215,28 @@ coro::Task<RecommendationResult> ResponseComposer::Compose(
             info.raw_request = prompt;
             auto reply = TryParseComposition(resp.raw_text, result.items);
             if (reply && !reply->empty()) {
+                // Phase 4-A: fact-check money/discount claims against the
+                // candidate items before the reply goes out. A violation never
+                // reaches the user — the deterministic template takes over and
+                // the compose_mode records why (the LLM call itself is still
+                // audited as a success above the guard layer).
+                if (guard_) {
+                    const auto fc = guard_->FactCheckReply(*reply, result.items);
+                    if (!fc.ok) {
+                        info.status = "guard_fallback";
+                        result.llm_calls.push_back(std::move(info));
+                        std::string detail;
+                        for (const auto& v : fc.violations) {
+                            if (!detail.empty()) detail += "; ";
+                            detail += v;
+                        }
+                        spdlog::warn("ResponseComposer: fact check failed ({}), "
+                                     "using template.", detail);
+                        result.compose_mode = "template_guard_fallback";
+                        result.response_text = BuildTemplateReply(result.items);
+                        co_return result;
+                    }
+                }
                 info.status = "success";
                 result.llm_calls.push_back(std::move(info));
                 result.compose_mode = "llm";

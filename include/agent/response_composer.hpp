@@ -2,6 +2,7 @@
 
 #include "agent/common.hpp"
 #include "agent/llm_client.hpp"
+#include "agent/safety_guard.hpp"
 #include "agent/stream_emitter.hpp"
 #include "coro/core/task.hpp"
 
@@ -13,7 +14,12 @@ namespace agent {
 
 class ResponseComposer {
 public:
-    explicit ResponseComposer(std::shared_ptr<LlmClient> llm);
+    // `guard` (optional, Phase 4-A) fact-checks the LLM's reply against the
+    // candidate items before it is returned; a violating reply is replaced by
+    // the deterministic template (compose_mode records the guard fallback).
+    // nullptr = no fact check (keeps existing call sites byte-identical).
+    explicit ResponseComposer(std::shared_ptr<LlmClient> llm,
+                              std::shared_ptr<const SafetyGuard> guard = nullptr);
 
     // Compose the final recommendation reply.
     //
@@ -40,6 +46,7 @@ public:
 
 private:
     std::shared_ptr<LlmClient> llm_;
+    std::shared_ptr<const SafetyGuard> guard_;   // may be null (no fact check)
 };
 
 } // namespace agent

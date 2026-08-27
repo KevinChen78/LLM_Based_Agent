@@ -454,6 +454,8 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
             item.district = item_json.value("district", "");
             item.sold_count = item_json.value("sold_count", 0);
             item.rating = item_json.value("rating", 0.0);
+            item.min_people = item_json.value("min_people", 0);
+            item.max_people = item_json.value("max_people", 0);
             if (item_json.contains("tags")) {
                 item.tags = item_json["tags"].get<std::vector<std::string>>();
             }
