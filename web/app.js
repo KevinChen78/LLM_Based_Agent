@@ -360,6 +360,13 @@
       case 'delta':
         appendDelta(handle, data.content || '');
         break;
+      case 'replace':
+        // Phase 4-B:事实校验在流式输出完成后发现违规,服务端用本事件整体
+        // 替换该条回复为模板兜底。旧前端无此 case 会走 default 静默忽略。
+        handle.text = data.content || '';
+        handle.content.textContent = handle.text;
+        scrollToBottom();
+        break;
       case 'final':
         ctx.final = data;
         break;

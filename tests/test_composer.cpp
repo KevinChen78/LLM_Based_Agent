@@ -90,6 +90,18 @@ public:
         std::lock_guard<std::mutex> l(m_);
         return delta_count_;
     }
+    // Count events of a given type (e.g. "replace").
+    int event_count(const std::string& type) const {
+        std::lock_guard<std::mutex> l(m_);
+        int n = 0;
+        for (const auto& e : events_) if (e.first == type) ++n;
+        return n;
+    }
+    nlohmann::json event_payload(const std::string& type) const {
+        std::lock_guard<std::mutex> l(m_);
+        for (const auto& e : events_) if (e.first == type) return e.second;
+        return nullptr;
+    }
 
 private:
     mutable std::mutex m_;
@@ -356,4 +368,47 @@ TEST(ResponseComposer, NullGuardKeepsOldBehavior) {
 
     EXPECT_EQ(result.compose_mode, "llm");
     EXPECT_EQ(result.response_text, "只要 1 元！纯编造但无 guard 不拦截。");
+}
+
+TEST(ResponseComposer, StreamingFactViolationEmitsReplace) {
+    auto llm = std::make_shared<FakeStreamingLlm>();
+    llm->chunks = {"只要 ", "99 ", "元！"};
+    llm->joined = "只要 99 元！";   // fabricated price, streamed out live
+    auto guard = std::make_shared<SafetyGuard>();
+    ResponseComposer composer(llm, guard);
+    auto emitter = std::make_shared<RecordingEmitter>();
+
+    std::vector<RecommendationItem> items{MakeItem("gb-1", "蒜蓉小龙虾（3 人餐）", 268.0)};
+    auto result = composer.Compose("武汉吃小龙虾", json::object(), items, emitter).result();
+
+    // The fabricated deltas already went out (streaming experience intact)...
+    EXPECT_EQ(emitter->deltas(), "只要 99 元！");
+    // ...then a trailing replace event carries the template correction.
+    EXPECT_EQ(result.compose_mode, "llm_stream_guard_fallback");
+    ASSERT_EQ(emitter->event_count("replace"), 1);
+    const auto payload = emitter->event_payload("replace");
+    ASSERT_TRUE(payload.contains("content"));
+    EXPECT_EQ(payload["content"].get<std::string>(), result.response_text);
+    EXPECT_NE(result.response_text.find("为您推荐以下团购"), std::string::npos);
+    EXPECT_EQ(result.response_text.find("99"), std::string::npos);
+    ASSERT_EQ(result.llm_calls.size(), 1u);
+    EXPECT_EQ(result.llm_calls[0].status, "guard_fallback");
+}
+
+TEST(ResponseComposer, StreamingHonestReplyPassesGuardWithoutReplace) {
+    auto llm = std::make_shared<FakeStreamingLlm>();
+    llm->chunks = {"现价 ", "268 ", "元"};
+    llm->joined = "现价 268 元";
+    auto guard = std::make_shared<SafetyGuard>();
+    ResponseComposer composer(llm, guard);
+    auto emitter = std::make_shared<RecordingEmitter>();
+
+    std::vector<RecommendationItem> items{MakeItem("gb-1", "蒜蓉小龙虾（3 人餐）", 268.0)};
+    auto result = composer.Compose("武汉吃小龙虾", json::object(), items, emitter).result();
+
+    EXPECT_EQ(result.compose_mode, "llm_stream");
+    EXPECT_EQ(result.response_text, "现价 268 元");
+    EXPECT_EQ(emitter->event_count("replace"), 0);
+    ASSERT_EQ(result.llm_calls.size(), 1u);
+    EXPECT_EQ(result.llm_calls[0].status, "success");
 }
