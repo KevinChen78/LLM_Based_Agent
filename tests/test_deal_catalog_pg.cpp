@@ -18,7 +18,7 @@ constexpr const char* kDeadDsn =
 TEST(DealCatalogPg, BadDsnFallsBackToJsonFile) {
     agent::DealCatalog c("data/deals.json", kDeadDsn);
     EXPECT_TRUE(c.Loaded());
-    EXPECT_EQ(c.Size(), 5320u);   // same data-file convention as test_deals_tools.cpp
+    EXPECT_EQ(c.Size(), 5512u);   // same data-file convention as test_deals_tools.cpp
     EXPECT_EQ(c.Source(), "file:data/deals.json");
     EXPECT_EQ(c.Deals()[0]["item_id"], "gb-20001");
 }
@@ -45,7 +45,7 @@ TEST(DealCatalogPg, LivePostgresMatchesFile) {
     EXPECT_EQ(pg.Source(), "postgres");
     agent::DealCatalog file("data/deals.json");
     ASSERT_EQ(pg.Size(), file.Size());
-    ASSERT_EQ(pg.Size(), 5320u);
+    ASSERT_EQ(pg.Size(), 5512u);
     auto pg_deals = pg.Deals();
     auto file_deals = file.Deals();
     for (size_t i = 0; i < pg_deals.size(); ++i) {
