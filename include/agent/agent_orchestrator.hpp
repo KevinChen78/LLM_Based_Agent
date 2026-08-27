@@ -59,6 +59,7 @@ private:
         std::vector<LlmCallInfo> llm_calls;  // planner attempts + composer call
         std::string slots_json;
         std::string rank_audit_json;         // ranker tool's rank_audit object (Phase 2.1)
+        std::string recall_audit_json;       // retriever's recall_audit object (Phase 3-C)
     };
 
     coro::Task<RecommendationResult> ChatStreamInner(

@@ -453,11 +453,48 @@ def candidate_deals(query):
 RRF_K = 60          # standard reciprocal-rank-fusion constant
 VEC_POOL = 40       # min per-channel pool size (also top_k*4 when larger)
 
+# Phase 3-C: category relaxation chain. The planner's category vocabulary and
+# the catalog's are not the same set ("早茶" is a tag, not a category), and a
+# hard `category =` filter on such a value survives zero rows. Chain:
+#   level 0 — exact category (unchanged behaviour)
+#   level 1 — curated alias (宁缺毋滥: only well-established mappings)
+#   level 2 — drop category entirely (city + text/price/people still apply)
+# Single point shared by both backends via candidate_deals(), so the
+# json/postgres parity matrix keeps holding.
+CATEGORY_ALIASES = {
+    "早茶": "粤菜",
+    "汉堡": "西餐",
+    "披萨": "西餐",
+    "炸鸡": "西餐",
+}
+
+
+def relaxed_candidates(body):
+    """Run the category relaxation chain. Returns
+    (candidate_pairs, relaxed_level, effective_body) — effective_body is the
+    query dict with the category actually used (alias or dropped), which the
+    vector channel must also filter by."""
+    cat = body.get("category", "")
+    pairs = candidate_deals(body)
+    if pairs or not cat:
+        return pairs, 0, body
+    alias = CATEGORY_ALIASES.get(cat)
+    if alias:
+        aliased = {**body, "category": alias}
+        pairs = candidate_deals(aliased)
+        if pairs:
+            return pairs, 1, aliased
+    dropped = {**body, "category": ""}
+    pairs = candidate_deals(dropped)
+    # Level 2 is reported even when still empty — the audit trail should show
+    # that relaxation was tried, not silently look like a level-0 miss.
+    return pairs, 2, dropped
+
 
 def retrieve_deals(body):
     query_str = body.get("query", "") or ""
     top_k = int(body.get("top_k", 20))
-    candidates = candidate_deals(body)
+    candidates, relaxed_level, effective = relaxed_candidates(body)
 
     bm25_ranked, vec_ranked = [], []
     if query_str.strip():
@@ -469,7 +506,7 @@ def retrieve_deals(body):
         if VECTOR_ON and POOL is not None:
             try:
                 vec = vec_literal(next(iter(EMBED_MODEL.embed([query_str]))))
-                vec_ranked = pg_vector_ranked(POOL, body, vec, pool_n)
+                vec_ranked = pg_vector_ranked(POOL, effective, vec, pool_n)
             except Exception as e:  # noqa: BLE001 — degrade this request only
                 print(f"[Retrieval] WARNING: vector query failed ({e});"
                       " BM25 only this request")
@@ -509,7 +546,14 @@ def retrieve_deals(body):
             d2["score"] = d.get("rating", 0) / 5.0
             items.append(d2)
 
-    return {"items": items, "total": len(candidates)}
+    resp = {"items": items, "total": len(candidates)}
+    # Phase 3-C audit fields — additive and only present when the relaxation
+    # chain actually fired, so relaxed_level=0 responses stay byte-identical
+    # to before (old C++ clients never see a new key).
+    if relaxed_level:
+        resp["relaxed_level"] = relaxed_level
+        resp["effective_category"] = effective.get("category", "")
+    return resp
 
 
 def retrieve_kb(body):

@@ -72,6 +72,13 @@ MATRIX = [
     ("/v1/retrieve/deals", {"query": "火锅", "top_k": 3}),
     ("/v1/retrieve/deals", {"category": "烧烤", "query": "烤", "top_k": 50}),
     ("/v1/retrieve/deals", {"city": "杭州"}),
+    # Phase 3-C relaxation chain: level 1 (alias), level 2 (drop category),
+    # and level 2 still-empty (unknown city). Both backends must agree on the
+    # relaxed outcome AND the audit fields.
+    ("/v1/retrieve/deals", {"city": "武汉", "category": "早茶"}),
+    ("/v1/retrieve/deals", {"city": "武汉", "category": "汉堡"}),
+    ("/v1/retrieve/deals", {"city": "武汉", "category": "不存在的类目xyz"}),
+    ("/v1/retrieve/deals", {"city": "杭州", "category": "早茶"}),
     ("/v1/retrieve/kb", {"query": "发票"}),
     ("/v1/retrieve/kb", {"query": "包间", "top_k": 1}),
     ("/v1/retrieve/kb", {"query": "退款 政策", "top_k": 5}),
@@ -198,6 +205,12 @@ def main():
             errs = diff_items(f"{path} {body}", rj.get(key, []), rp.get(key, []))
             if rj.get("total") != rp.get("total"):
                 errs.append(f"total differs: json={rj.get('total')} pg={rp.get('total')}")
+            # Phase 3-C audit fields must agree across backends too (absent on
+            # both when the relaxation chain did not fire).
+            for field in ("relaxed_level", "effective_category"):
+                if rj.get(field) != rp.get(field):
+                    errs.append(f"{field} differs: json={rj.get(field)!r}"
+                                f" pg={rp.get(field)!r}")
             label = f"{path} {json.dumps(body, ensure_ascii=False)}"
             if errs:
                 failures += 1

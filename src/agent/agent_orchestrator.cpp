@@ -162,6 +162,20 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStream(
         e.request_text = user_message;
         e.action = result.next_state;
         e.slots_json = audit.slots_json.empty() ? "{}" : audit.slots_json;
+        // Phase 3-C recall audit rides in slots_json as underscore-prefixed
+        // keys (no new column; consumers read only known slot keys). Only when
+        // the relaxation chain actually fired.
+        if (!audit.recall_audit_json.empty()) {
+            try {
+                auto slots = nlohmann::json::parse(e.slots_json);
+                auto ra = nlohmann::json::parse(audit.recall_audit_json);
+                slots["_relaxed_level"] = ra.value("relaxed_level", 0);
+                slots["_effective_category"] = ra.value("effective_category", "");
+                e.slots_json = slots.dump();
+            } catch (const std::exception& ex) {
+                spdlog::warn("Failed to merge recall_audit: {}", ex.what());
+            }
+        }
         e.item_count = static_cast<int>(result.items.size());
         auto ranked = nlohmann::json::array();
         for (size_t i = 0; i < result.items.size() && i < 5; ++i) {
@@ -410,6 +424,13 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
                 } else {
                     // A retriever (or other producer) adds candidates.
                     for (const auto& it : j["items"]) accumulated_items.push_back(it);
+                    // Recall-relaxation audit (Phase 3-C): the retrieval
+                    // service reports relaxed_level / effective_category when
+                    // its category chain fired; persisted into slots_json by
+                    // the outer shell (no new column).
+                    if (audit && j.contains("recall_audit") && j["recall_audit"].is_object()) {
+                        audit->recall_audit_json = j["recall_audit"].dump();
+                    }
                 }
             } catch (const std::exception& e) {
                 spdlog::error("Failed to parse tool result: {}", e.what());

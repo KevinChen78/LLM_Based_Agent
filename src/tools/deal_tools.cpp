@@ -183,6 +183,17 @@ coro::Task<ToolResult> DealRetriever::Execute(const ToolCall& call) {
                 out["total"] = resp->contains("total")
                     ? (*resp)["total"]
                     : nlohmann::json(out_items.size());
+                // Phase 3-C recall audit: the service reports when its
+                // category relaxation chain fired (additive response fields).
+                // Forwarded verbatim — same pattern as the ranker's
+                // rank_audit; the orchestrator persists it. Absent on old
+                // services / unrelaxed queries.
+                if (resp->contains("relaxed_level")) {
+                    nlohmann::json ra;
+                    ra["relaxed_level"] = (*resp)["relaxed_level"];
+                    ra["effective_category"] = resp->value("effective_category", "");
+                    out["recall_audit"] = std::move(ra);
+                }
                 result.result_json = out.dump();
                 spdlog::info("deal_retriever(BM25): query='{}' city={} -> {}/{} matched",
                              keywords, city, out_items.size(),

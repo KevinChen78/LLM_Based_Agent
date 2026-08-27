@@ -163,6 +163,56 @@ TEST(DealRetrieverBm25, FallsBackToLocalWhenServiceFails) {
     }
 }
 
+TEST(DealRetrieverBm25, RecallAuditForwardedWhenPresent) {
+    auto catalog = std::make_shared<DealCatalog>("");
+    auto client = std::make_shared<FakeRetrievalClient>();
+    client->deals_response = json{
+        {"total", 15},
+        {"relaxed_level", 1},
+        {"effective_category", "粤菜"},
+        {"items", json::array({
+            {{"item_id","gb-26031"},{"title","粤式早茶点心（2 人餐）"},{"city","深圳"},
+             {"price",168.0},{"original_price",268.0},{"rating",4.5},
+             {"sold_count",300},{"score",6.1}}
+        })}
+    };
+    DealRetriever retriever(catalog, client);
+
+    auto result = retriever.Execute(MakeCall("deal_retriever", {
+        {"city","深圳"},{"category","早茶"},{"top_k",5}
+    })).result();
+
+    ASSERT_TRUE(result.success) << result.error_message;
+    auto out = json::parse(result.result_json);
+    // Phase 3-C: relaxation audit forwarded verbatim for the orchestrator.
+    ASSERT_TRUE(out.contains("recall_audit"));
+    EXPECT_EQ(out["recall_audit"]["relaxed_level"], 1);
+    EXPECT_EQ(out["recall_audit"]["effective_category"], "粤菜");
+    EXPECT_EQ(out["total"], 15);
+}
+
+TEST(DealRetrieverBm25, NoRecallAuditWhenAbsent) {
+    auto catalog = std::make_shared<DealCatalog>("");
+    auto client = std::make_shared<FakeRetrievalClient>();
+    // Old-service shape: no relaxed_level key -> no recall_audit in output.
+    client->deals_response = json{
+        {"total", 3},
+        {"items", json::array({
+            {{"item_id","gb-1"},{"title","火锅"},{"city","武汉"},
+             {"price",128.0},{"rating",4.6},{"sold_count",800},{"score",7.0}}
+        })}
+    };
+    DealRetriever retriever(catalog, client);
+
+    auto result = retriever.Execute(MakeCall("deal_retriever", {
+        {"city","武汉"},{"category","火锅"},{"top_k",5}
+    })).result();
+
+    ASSERT_TRUE(result.success) << result.error_message;
+    auto out = json::parse(result.result_json);
+    EXPECT_FALSE(out.contains("recall_audit"));
+}
+
 TEST(DealRetrieverBm25, NoClientUsesLocalOnly) {
     auto catalog = std::make_shared<DealCatalog>("");
     DealRetriever retriever(catalog);   // no retrieval client injected
