@@ -13,7 +13,12 @@ public:
         const std::string& history,
         const std::string& user_message,
         const std::string& current_slots_json,
-        const std::string& user_profile_json = "");
+        const std::string& user_profile_json = "",
+        // Pre-joined ("、") list of categories that actually exist in the
+        // catalog (Phase 3-A). When non-empty the prompt carries a category
+        // whitelist section and the category slot rule tightens to it; when
+        // empty (no catalog wired) the prompt is byte-identical to before.
+        const std::string& category_list = "");
 
     static std::string ResponseCompositionPrompt(
         const std::string& user_request,

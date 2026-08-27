@@ -4,6 +4,7 @@
 
 #include <cstdlib>
 #include <fstream>
+#include <set>
 #include <sstream>
 
 #ifdef AGENT_HAVE_LIBPQ
@@ -131,6 +132,18 @@ nlohmann::json DealCatalog::Deals() const {
 size_t DealCatalog::Size() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return deals_.size();
+}
+
+std::vector<std::string> DealCatalog::DistinctCategories() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::set<std::string> cats;
+    for (const auto& d : deals_) {
+        if (d.contains("category") && d["category"].is_string()) {
+            const std::string c = d["category"].get<std::string>();
+            if (!c.empty()) cats.insert(c);
+        }
+    }
+    return {cats.begin(), cats.end()};
 }
 
 nlohmann::json DealCatalog::BuiltInFallback() {

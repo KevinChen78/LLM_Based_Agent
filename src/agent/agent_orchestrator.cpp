@@ -265,9 +265,19 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
         EmitIf(emitter, "planning", nlohmann::json{{"detail", "deciding next step"}});
         const nlohmann::json user_profile = ResolveUserProfile(
             profiles_.get(), catalog_.get(), req.user_context.user_id);
+        // Phase 3-A: ground the planner's category slot in the catalog's real
+        // vocabulary. Empty when no catalog is wired (prompt unchanged).
+        std::string category_list;
+        if (catalog_) {
+            const auto cats = catalog_->DistinctCategories();
+            for (size_t i = 0; i < cats.size(); ++i) {
+                if (i) category_list += "、";
+                category_list += cats[i];
+            }
+        }
         auto plan = co_await planner_->PlanNextStep(
             req.user_context, history, req.user_message, session.context,
-            user_profile);
+            user_profile, category_list);
         if (audit) {
             audit->slots_json = plan.slots.dump();
             for (auto& c : plan.llm_calls) audit->llm_calls.push_back(std::move(c));

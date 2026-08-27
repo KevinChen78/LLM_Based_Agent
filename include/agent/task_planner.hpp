@@ -36,7 +36,10 @@ public:
         const nlohmann::json& current_slots,
         // Cross-session user profile (Phase 2.2); empty object => the prompt
         // carries no profile section and behaviour is unchanged.
-        const nlohmann::json& user_profile = nlohmann::json::object());
+        const nlohmann::json& user_profile = nlohmann::json::object(),
+        // Pre-joined ("、") catalog category whitelist (Phase 3-A); empty =>
+        // no category section, prompt byte-identical to before.
+        const std::string& category_list = "");
 
 private:
     std::shared_ptr<LlmClient> llm_;

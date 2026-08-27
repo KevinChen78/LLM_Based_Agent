@@ -44,7 +44,8 @@ coro::Task<TaskPlanner::Plan> TaskPlanner::PlanNextStep(
     const std::vector<ConversationTurn>& history,
     const std::string& user_message,
     const nlohmann::json& current_slots,
-    const nlohmann::json& user_profile) {
+    const nlohmann::json& user_profile,
+    const std::string& category_list) {
     Plan plan;
 
     // Build history string
@@ -55,8 +56,8 @@ coro::Task<TaskPlanner::Plan> TaskPlanner::PlanNextStep(
 
     std::string prompt = PromptBuilder::TaskPlanningPrompt(
         history_str, user_message, current_slots.dump(),
-        user_profile.empty() ? "" : user_profile.dump());
-
+        user_profile.empty() ? "" : user_profile.dump(),
+        category_list);
     std::vector<LlmMessage> messages{
         {"system", "You are a task planner for a group-buying recommendation agent."},
         {"user", prompt}

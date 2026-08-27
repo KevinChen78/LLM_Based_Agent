@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace agent {
 
@@ -46,6 +47,11 @@ public:
 
     // "postgres" | "file:<path>" | "builtin" — which source won, for logging.
     const std::string& Source() const { return source_; }
+
+    // Distinct non-empty `category` values across the loaded catalog, sorted
+    // (deterministic). Works for all three sources — they all populate deals_.
+    // Used to ground the planner's category slot in reality (Phase 3-A).
+    std::vector<std::string> DistinctCategories() const;
 
 private:
     void LoadFromFile(const std::string& path);

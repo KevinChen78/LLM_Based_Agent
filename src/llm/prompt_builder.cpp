@@ -25,13 +25,29 @@ std::string UserProfileSection(const std::string& user_profile_json) {
 )" + user_profile_json + "\n";
 }
 
+// Build the "# 有效类目列表" block injected into the planning prompt when the
+// catalog's real category vocabulary is known (Phase 3-A). Returns an empty
+// string when no list is supplied so the prompt is byte-identical to before.
+std::string CategoryListSection(const std::string& category_list) {
+    if (category_list.empty()) return "";
+    return R"(
+# 有效类目列表（category 槽位只能从这里原样取值；用户的需求词不在列表中时，
+# category 留空字符串，把用户原词写进 keywords 交给文本检索）
+)" + category_list + "\n";
+}
+
 } // namespace
 
 std::string PromptBuilder::TaskPlanningPrompt(
     const std::string& history,
     const std::string& user_message,
     const std::string& current_slots_json,
-    const std::string& user_profile_json) {
+    const std::string& user_profile_json,
+    const std::string& category_list) {
+    // The category slot rule tightens once the real vocabulary is known.
+    const std::string category_rule = category_list.empty()
+        ? "- category：类目。如 海鲜、火锅、日料、烧烤。"
+        : "- category：类目。只能从下方「有效类目列表」中原样取值；列表中没有匹配的，category 留空。";
     return R"(# Role
 你是“团购推荐 Agent”的任务规划器。你的职责是：
 1. 理解用户当前输入；
@@ -42,13 +58,13 @@ std::string PromptBuilder::TaskPlanningPrompt(
 # Slot 定义
 - city：城市，必填。如 上海、北京。
 - district：区县/商圈，可选。如 黄浦、静安、中关村。
-- category：类目。如 海鲜、火锅、日料、烧烤。
+)" + category_rule + R"(
 - budget：预算（元）。指套餐总价或人均预算，用户说“人均 100”且人数为 3 时，budget = 300。
 - people：人数。
 - time：时间。如 今晚、明天中午、本周六。
 - preference：额外偏好。如 安静、包间、适合带孩子、有停车。
 - taboo：禁忌/不喜欢的。如 不吃辣、海鲜过敏。
-
+)" + CategoryListSection(category_list) + R"(
 # 关键规则
 1. 如果 city、category、budget 中任意一项缺失或置信度低，必须进入追问（action = "clarify"）。
 2. 如果信息足够，action = "retrieve"，并生成 deal_retriever 工具调用。

@@ -11,6 +11,7 @@ add_executable(test_agent
     test_experiment.cpp
     test_ranker_client.cpp
     test_user_profile.cpp
+    test_category_vocab.cpp
 )
 
 target_link_libraries(test_agent PRIVATE
