@@ -206,6 +206,7 @@ def start_api_server(db_path, log_path, llm_base_url="", retrieval_url="",
     env["AGENT_API_KEYS"] = ""
     env["RATE_LIMIT_RPS"] = ""
     env["RATE_LIMIT_BURST"] = ""
+    env["RETRIEVAL_PROTOCOL"] = "http"
     if obs_db_path:
         env["OBS_DB_PATH"] = obs_db_path
     if extra_env:

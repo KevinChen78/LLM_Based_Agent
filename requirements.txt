@@ -11,3 +11,11 @@ fastembed>=0.4,<1
 # Learning-to-rank (Phase 2.1): ranking_service + scripts/train_ranker.py only.
 # llm_gateway / e2e / generators / evaluators stay pure stdlib.
 lightgbm>=4.0,<5
+
+# gRPC pilot (Phase 5): retrieval_service gRPC front-end (GRPC_PORT, default
+# off) + the protocol dimension in scripts/test_pg_retrieval.py. grpcio is the
+# runtime; grpcio-tools only regenerates retrieval_service/gen/ stubs from
+# proto/retrieval.proto (see scripts/gen_grpc_py.py). Everything else stays
+# pure stdlib.
+grpcio>=1.71,<2
+grpcio-tools>=1.71,<2

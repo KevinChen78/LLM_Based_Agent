@@ -30,6 +30,10 @@ SERVICE = os.path.join(PROJECT, "retrieval_service", "main.py")
 
 JSON_PORT = 8101
 PG_PORT = 8102
+# Phase 5-D: gRPC front-ends of the same two instances (same process,
+# GRPC_PORT). The matrix then runs over http AND grpc per backend.
+GRPC_JSON_PORT = 8111
+GRPC_PG_PORT = 8112
 
 
 # Same loader semantics as retrieval_service/main.py, so PG_DSN/PGHOST/... set
@@ -132,7 +136,7 @@ def pg_available():
         return False, f"PG unreachable: {e}"
 
 
-def start_service(port, backend):
+def start_service(port, backend, grpc_port=None):
     env = dict(os.environ)
     env["RETRIEVAL_PORT"] = str(port)
     env["RETRIEVAL_BACKEND"] = backend
@@ -140,9 +144,61 @@ def start_service(port, backend):
     # The vector channel only exists on postgres and legitimately changes
     # rankings, so pin it off; vector recall is covered by test_pg_vector.py.
     env["RETRIEVAL_VECTOR"] = "off"
+    if grpc_port:
+        env["GRPC_PORT"] = str(grpc_port)
     return subprocess.Popen(
         [sys.executable, SERVICE], env=env,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ---------------------------------------------------------------------------
+# gRPC client (Phase 5-D). Optional: if grpcio is missing the protocol
+# dimension is skipped and the http-only matrix still runs.
+# ---------------------------------------------------------------------------
+def _grpc_stub_class():
+    try:
+        sys.path.insert(0, os.path.join(PROJECT, "retrieval_service", "gen"))
+        import grpc  # noqa: F401
+        import retrieval_pb2
+        import retrieval_pb2_grpc
+        return retrieval_pb2, retrieval_pb2_grpc
+    except ImportError:
+        return None, None
+
+
+def grpc_call(stub, pb2, path, body):
+    """Run one matrix case over gRPC and return the HTTP-shaped dict."""
+    if path.endswith("deals"):
+        req = pb2.RetrieveDealsRequest(
+            city=body.get("city", ""), district=body.get("district", ""),
+            category=body.get("category", ""), query=body.get("query", ""))
+        # Presence mirrors the HTTP contract (absent != 0).
+        for f in ("max_price", "min_price", "people", "top_k"):
+            if f in body:
+                setattr(req, f, body[f])
+        r = stub.RetrieveDeals(req, timeout=10)
+        out = {"total": r.total, "items": [
+            {"item_id": it.item_id, "title": it.title, "category": it.category,
+             "city": it.city, "district": it.district, "price": it.price,
+             "original_price": it.original_price, "rating": it.rating,
+             "sold_count": it.sold_count, "score": it.score,
+             "description": it.description, "merchant_id": it.merchant_id,
+             "min_people": it.min_people, "max_people": it.max_people,
+             "tags": list(it.tags)}
+            for it in r.items]}
+        if r.HasField("relaxed_level"):
+            out["relaxed_level"] = r.relaxed_level
+            out["effective_category"] = r.effective_category
+        return out
+    req = pb2.RetrieveKbRequest(query=body.get("query", ""))
+    if "top_k" in body:
+        req.top_k = body["top_k"]
+    r = stub.RetrieveKb(req, timeout=10)
+    return {"passages": [
+        {"id": p.id, "category": p.category, "title": p.title,
+         "content": p.content, "source": p.source, "score": p.score,
+         "tags": list(p.tags)}
+        for p in r.passages]}
 
 
 def score_close(a, b):
@@ -182,8 +238,12 @@ def main():
 
     procs = []
     try:
-        procs.append(start_service(JSON_PORT, "json"))
-        procs.append(start_service(PG_PORT, "postgres"))
+        pb2, pb2_grpc = _grpc_stub_class()
+        use_grpc = pb2 is not None
+        procs.append(start_service(JSON_PORT, "json",
+                                   grpc_port=GRPC_JSON_PORT if use_grpc else None))
+        procs.append(start_service(PG_PORT, "postgres",
+                                   grpc_port=GRPC_PG_PORT if use_grpc else None))
         hj = wait_up(JSON_PORT, procs[0])
         hp = wait_up(PG_PORT, procs[1])
 
@@ -225,6 +285,46 @@ def main():
             return 1
         print(f"\nPASS: all {len(MATRIX)} cases identical across backends "
               f"(deals={hj['deal_count']}, kb={hj['kb_count']})")
+
+        # Phase 5-D: same matrix over the gRPC front-end. grpc(x) must equal
+        # http(x) per backend — the two protocols share handler functions, so
+        # any divergence is a serialization/adapter bug.
+        if not use_grpc:
+            print("SKIP grpc dimension: grpcio not installed "
+                  "(pip install -r requirements.txt)")
+            return 0
+        import grpc as _grpc
+        stubs = {}
+        for name, port in (("json", GRPC_JSON_PORT), ("postgres", GRPC_PG_PORT)):
+            channel = _grpc.insecure_channel(f"127.0.0.1:{port}")
+            _grpc.channel_ready_future(channel).result(timeout=15)
+            stubs[name] = pb2_grpc.RetrievalServiceStub(channel)
+        gfail = 0
+        for path, body in MATRIX:
+            key = "items" if path.endswith("deals") else "passages"
+            label = f"{path} {json.dumps(body, ensure_ascii=False)}"
+            for name, http_port in (("json", JSON_PORT), ("postgres", PG_PORT)):
+                rg = grpc_call(stubs[name], pb2, path, body)
+                rh = post(http_port, path, body)
+                errs = diff_items(f"grpc-vs-http/{name}", rg.get(key, []),
+                                  rh.get(key, []))
+                if rg.get("total") != rh.get("total"):
+                    errs.append(f"total differs: grpc={rg.get('total')}"
+                                f" http={rh.get('total')}")
+                for field in ("relaxed_level", "effective_category"):
+                    if rg.get(field) != rh.get(field):
+                        errs.append(f"{field} differs: grpc={rg.get(field)!r}"
+                                    f" http={rh.get(field)!r}")
+                if errs:
+                    gfail += 1
+                    print(f"FAIL [grpc/{name}] {label}")
+                    for e in errs[:6]:
+                        print(f"     {e}")
+        if gfail:
+            print(f"\n{gfail}/{len(MATRIX) * 2} grpc cases MISMATCHED")
+            return 1
+        print(f"PASS: all {len(MATRIX)} cases identical over gRPC vs HTTP "
+              f"(both backends)")
         return 0
     finally:
         for p in procs:

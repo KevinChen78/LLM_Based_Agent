@@ -25,6 +25,14 @@ rem is unreachable). Fill in the password from retrieval_service/.env.local.
 set CATALOG_BACKEND=postgres
 set PG_DSN=host=127.0.0.1 port=5432 dbname=groupbuy user=agent password=agent_dev_2026
 
+rem Phase 5 gRPC pilot (both default off; require grpcio for the Python side
+rem and an ENABLE_GRPC=ON build of api_server). Uncomment to enable:
+rem   retrieval_service additionally serves gRPC on GRPC_PORT;
+rem   api_server talks gRPC and falls back to HTTP on any gRPC failure.
+rem set GRPC_PORT=8011
+rem set RETRIEVAL_PROTOCOL=grpc
+rem set RETRIEVAL_GRPC_ADDR=127.0.0.1:8011
+
 echo [1/4] Starting retrieval_service on :8001 ...
 start "retrieval_service :8001" python retrieval_service/main.py
 

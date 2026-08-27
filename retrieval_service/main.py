@@ -573,6 +573,22 @@ def retrieve_kb(body):
 # ---------------------------------------------------------------------------
 # HTTP server
 # ---------------------------------------------------------------------------
+def health_payload():
+    """Health payload shared by the HTTP and gRPC front-ends (Phase 5-D)."""
+    payload = {
+        "status": "ok",
+        "corpora": ["deals", "kb"],
+        "deal_count": len(DEAL_CORPUS.docs),
+        "kb_count": len(KB_CORPUS.docs),
+        "backend": BACKEND,
+        "vector": "on" if VECTOR_ON else "off",
+        "tokenizer": "char-bigram + ascii-word (BM25)",
+    }
+    if VECTOR_ON:
+        payload["vector_model"] = EMBED_MODEL_NAME
+    return payload
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send_json(self, status, obj):
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -584,18 +600,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/v1/health":
-            payload = {
-                "status": "ok",
-                "corpora": ["deals", "kb"],
-                "deal_count": len(DEAL_CORPUS.docs),
-                "kb_count": len(KB_CORPUS.docs),
-                "backend": BACKEND,
-                "vector": "on" if VECTOR_ON else "off",
-                "tokenizer": "char-bigram + ascii-word (BM25)",
-            }
-            if VECTOR_ON:
-                payload["vector_model"] = EMBED_MODEL_NAME
-            self._send_json(200, payload)
+            self._send_json(200, health_payload())
             return
         self.send_error(404)
 
@@ -623,10 +628,22 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    # Phase 5-D: optional gRPC front-end on GRPC_PORT (default off). Same
+    # process, same handler functions as HTTP — behaviour cannot drift.
+    grpc_ref = None
+    try:
+        import grpc_server
+        grpc_ref = grpc_server.maybe_start_grpc(
+            retrieve_deals, retrieve_kb, health_payload)
+    except Exception as e:  # noqa: BLE001 — gRPC is a pilot; never block HTTP
+        print(f"[Retrieval] WARNING: gRPC front-end failed to start ({e}); "
+              "HTTP only")
+
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"[Retrieval] Running on http://0.0.0.0:{PORT}  backend={BACKEND}"
           f"  vector={'on' if VECTOR_ON else 'off'}"
-          f"  deals={len(DEAL_CORPUS.docs)}  kb={len(KB_CORPUS.docs)}")
+          f"  deals={len(DEAL_CORPUS.docs)}  kb={len(KB_CORPUS.docs)}"
+          f"  grpc={'off' if grpc_ref is None else 'on'}")
     if BACKEND == "json":
         print(f"[Retrieval] (json files: {DEALS_PATH}, {KB_PATH})")
     try:
@@ -634,6 +651,8 @@ def main():
     except KeyboardInterrupt:
         print("[Retrieval] Shutting down.")
         server.shutdown()
+        if grpc_ref is not None:
+            grpc_ref[0].stop(grace=1)
 
 
 if __name__ == "__main__":

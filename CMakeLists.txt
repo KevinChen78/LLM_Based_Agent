@@ -91,6 +91,13 @@ target_link_libraries(agent_core PUBLIC
     sqlite3
 )
 
+# Phase 5-D: gRPC pilot — GrpcRetrievalClient compiles its real body only
+# under AGENT_HAVE_GRPC; OFF builds get the HTTP pass-through (same TU).
+if(ENABLE_GRPC)
+    target_link_libraries(agent_core PUBLIC retrieval_proto grpc++)
+    target_compile_definitions(agent_core PUBLIC AGENT_HAVE_GRPC=1)
+endif()
+
 if(WIN32)
     target_link_libraries(agent_core PUBLIC ws2_32 wsock32 crypt32)
 endif()

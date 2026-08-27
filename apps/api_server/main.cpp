@@ -8,6 +8,7 @@
 #include "agent/api_auth.hpp"
 #include "agent/deal_catalog.hpp"
 #include "agent/deal_tools.hpp"
+#include "agent/grpc_retrieval_client.hpp"
 #include "agent/llm_client.hpp"
 #include "agent/observability_store.hpp"
 #include "agent/rate_limiter.hpp"
@@ -180,9 +181,32 @@ int main() {
     // When set: DealRetriever delegates text ranking to BM25 and the kb_search
     // tool becomes available for knowledge-base RAG. When empty, both degrade
     // to the local substring retriever and no KB — offline behaviour unchanged.
+    //   RETRIEVAL_PROTOCOL=http|grpc   (Phase 5-D pilot; default http)
+    //   RETRIEVAL_GRPC_ADDR=127.0.0.1:8011   (gRPC front-end of the same service)
+    // grpc mode requires a binary built with ENABLE_GRPC=ON; without it (or on
+    // any gRPC failure) calls fall back to the HTTP client.
     const char* retr_env = std::getenv("RETRIEVAL_SERVICE_URL");
     std::string retr_url = retr_env ? retr_env : "";
-    auto retrieval = std::make_shared<RetrievalClient>(retr_url);
+    const char* proto_env = std::getenv("RETRIEVAL_PROTOCOL");
+    std::string retr_protocol = proto_env ? proto_env : "http";
+    const char* grpc_env = std::getenv("RETRIEVAL_GRPC_ADDR");
+    std::string retr_grpc_addr = grpc_env ? grpc_env : "";
+    std::shared_ptr<RetrievalClient> retrieval;
+    if (retr_protocol == "grpc" && !retr_grpc_addr.empty()) {
+        auto grpc_client = std::make_shared<GrpcRetrievalClient>(retr_url, retr_grpc_addr);
+#ifdef AGENT_HAVE_GRPC
+        std::cout << "Retrieval protocol: grpc (" << retr_grpc_addr
+                  << ", HTTP fallback " << (retr_url.empty() ? "<none>" : retr_url) << ")"
+                  << (grpc_client->GrpcActive() ? "" : " [grpc inactive — HTTP only]")
+                  << std::endl;
+#else
+        std::cout << "Retrieval protocol: grpc requested but binary built without "
+                     "ENABLE_GRPC; using HTTP" << std::endl;
+#endif
+        retrieval = grpc_client;
+    } else {
+        retrieval = std::make_shared<RetrievalClient>(retr_url);
+    }
     tools->Register(std::make_shared<DealRetriever>(catalog, retrieval));
     // Learning-to-rank service (Phase 2.1). Enabled by setting
     //   RANKER_SERVICE_URL=http://localhost:8002
