@@ -210,6 +210,29 @@ $env:SESSION_STORE="memory"
 
 构造 `AgentOrchestrator` 时传 `SafetyGuard` 即启用，传 `nullptr` 则跳过（默认参数，不破坏现有调用）。规则集见 [include/agent/safety_guard.hpp](include/agent/safety_guard.hpp) 与 [src/agent/safety_guard.cpp](src/agent/safety_guard.cpp)；单测见 [tests/test_safety_guard.cpp](tests/test_safety_guard.cpp)。
 
+## API 鉴权与限流(Phase 5,默认关闭)
+
+- **API key 鉴权**:`AGENT_API_KEYS`(逗号分隔)设置后,`/v1/chat`、
+  `/v1/chat/stream`、`/v1/feedback`、`/v1/metrics` 要求 `X-Api-Key` header,
+  失败 401;`/v1/health` 与静态资源豁免。空 = 关闭,行为与之前逐字节一致。
+  比较恒定时间防时序侧信道。
+- **限流**:`RATE_LIMIT_RPS` / `RATE_LIMIT_BURST` 设置后启用每用户内存令牌桶
+  (key:user_id → API key → anonymous;SSE 按请求计 1 次),超限 429 +
+  `Retry-After`。空/0 = 不限。`/v1/metrics` 响应含
+  `api_guard{auth_rejected, rate_limited}` 计数器。
+- **多实例**:`AGENT_PORT`(默认 8080)。
+
+## 服务间 gRPC 试点(Phase 5,retrieval_service)
+
+HTTP JSON 契约冻结不变,gRPC 作为**并存试点**:`-DENABLE_GRPC=ON`(默认 OFF)
+源码构建工具链;retrieval_service 设 `GRPC_PORT=8011` 后同进程双协议(共用
+handler);api_server 设 `RETRIEVAL_PROTOCOL=grpc` +
+`RETRIEVAL_GRPC_ADDR=127.0.0.1:8011` 走 gRPC,**任何 gRPC 失败逐调用回退
+HTTP**。契约 `proto/retrieval.proto` 逐字段镜像 HTTP 形状;一致性由
+`scripts/test_pg_retrieval.py` 的协议×后端矩阵守护。配置/踩坑/回滚详见
+[docs/phase5_auth_grpc.md](docs/phase5_auth_grpc.md)。
+
+
 ## 观测与评估（recommendation_logs / llm_calls / metrics / evaluate.py）
 
 每次请求落一行推荐审计、每次 LLM 调用落一行调用审计（独立库 `data/observability.db`，
@@ -538,9 +561,11 @@ BM25 委托/回退/无 client 不回归）与 [tests/test_composer.cpp](tests/te
 
 ### 2.4 服务化与生产横切
 
-- **gRPC**：`proto/agent_service.proto` 已定义未接线；C++↔Python 服务间调用从
-  HTTP 迁 gRPC（性能与契约强度）。
-- **API 中间件**：鉴权（JWT）、限流（令牌桶）、Trace 注入（对接已有 trace_id）。
+- **gRPC**：retrieval_service 已试点双协议并存（见上文 Phase 5 节）；
+  待办：推广到 llm_gateway / ranking_service(gateway 涉 SSE 流式需单独评估)、
+  对外 `proto/agent_service.proto` 启用。
+- **API 中间件**：鉴权（API key 已落地,JWT 未做）、限流（令牌桶已落地）、
+  Trace 注入（对接已有 trace_id,401/429 已带 trace_id）。
 - **外部工具**：`ExternalToolClient`（地图/营业时间/优惠券实时信息），扩展
   planner 的工具集。
 - **管理后台**：`apps/admin_console`——配置热更（Prompt 版本/模型名/超参）、

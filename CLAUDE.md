@@ -89,7 +89,9 @@ JSON 容错解析 + 温度 0 重试)→ 工具注册表(`DealRetriever`/`DealRan
   PG 不可达→DealCatalog 回退 JSON 文件→内置 8 条;ranking_service 挂/
   无模型/`RANKER_MODE=off`→DealRanker 回退规则分(taboo 剔除永远留在
   C++ 侧、先于模型调用);UserProfileStore 不可用/无画像→planner prompt
-  无画像段(逐字节同无画像行为)。改任何一层都不能破坏降级链。
+  无画像段(逐字节同无画像行为);`RETRIEVAL_PROTOCOL=grpc` 时 gRPC 失败
+  逐调用回退 HTTP(再失败走原链);无 `ENABLE_GRPC` 编译时
+  GrpcRetrievalClient 整体是 HTTP 直通。改任何一层都不能破坏降级链。
 - **DealCatalog 三源回退**:ctor `DealCatalog(json_path, pg_dsn="")`,
   pg_dsn 非空先经 libpq 直连 `groupbuy_items`(`AGENT_HAVE_LIBPQ` 编译开关,
   CMake `ENABLE_PG_CATALOG` 自动探测 `C:/Program Files/PostgreSQL/17` 并
@@ -128,6 +130,10 @@ active)/ `RANKER_TREATMENT_PCT` / `RANKER_EXPERIMENT`(api_server,
 Phase 2.1 学习排序与 A/B 分桶;ranking_service 侧见
 ranking_service/.env.example)、`PG_TEST_DSN`(设置后 DealCatalog live-PG 用例不 SKIP)、
 `DEALS_CATALOG_PATH`、`OBS_DB_PATH`、`WEB_DIR`。
+Phase 5:`AGENT_API_KEYS`(空=鉴权关)、`RATE_LIMIT_RPS`/`RATE_LIMIT_BURST`
+(空=不限)、`AGENT_PORT`(默认 8080)、`RETRIEVAL_PROTOCOL`(http|grpc)/
+`RETRIEVAL_GRPC_ADDR` / `GRPC_PORT`(检索服务 gRPC 前端,空=关)、
+CMake `ENABLE_GRPC`(默认 OFF;踩坑与手动 clone 流程见 docs/phase5_auth_grpc.md)。
 `.env` 加载是 setdefault 语义且 .env 先于 .env.local——同名键 .env 赢,每个键只定义一处。
 
 ## Windows 环境坑(已踩过)
