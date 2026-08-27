@@ -10,8 +10,10 @@
 #include "retrieval.grpc.pb.h"
 
 #include <grpcpp/grpcpp.h>
+#include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <mutex>
 #include <sstream>
 
 namespace agent {
@@ -30,6 +32,21 @@ using groupbuy::retrieval::v1::RetrievalService;
 // 5s is already far beyond p99. (ClientContext is non-copyable/non-movable,
 // hence the unique_ptr.)
 constexpr int kGrpcDeadlineMs = 5000;
+
+// Phase 4-D: a gRPC failure silently falls through to HTTP — make that
+// visible in logs, but rate-limited (one warn per 60s) so a down server does
+// not spam on every request.
+void WarnGrpcFallback(const char* op, const grpc::Status& st) {
+    static std::mutex mu;
+    static std::chrono::steady_clock::time_point last{};
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lk(mu);
+    if (now - last < std::chrono::seconds(60)) return;
+    last = now;
+    spdlog::warn("GrpcRetrievalClient: {} failed (code={}, {}); falling back "
+                 "to HTTP (further warnings throttled 60s)",
+                 op, static_cast<int>(st.error_code()), st.error_message());
+}
 
 std::unique_ptr<grpc::ClientContext> MakeContext() {
     auto ctx = std::make_unique<grpc::ClientContext>();
@@ -72,8 +89,13 @@ GrpcRetrievalClient::GrpcRetrievalClient(std::string http_base_url,
       grpc_addr_(std::move(grpc_addr)) {
     if (!grpc_addr_.empty()) {
         impl_ = std::make_unique<Impl>();
-        impl_->channel = grpc::CreateChannel(grpc_addr_,
-                                             grpc::InsecureChannelCredentials());
+        // Phase 4-D: cap the reconnect backoff well below the default (~20s+)
+        // so a recovered retrieval_service is picked up within one request
+        // deadline instead of a multi-minute backoff tail.
+        grpc::ChannelArguments ch_args;
+        ch_args.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 2000);
+        impl_->channel = grpc::CreateCustomChannel(
+            grpc_addr_, grpc::InsecureChannelCredentials(), ch_args);
         impl_->stub = RetrievalService::NewStub(impl_->channel);
     }
 }
@@ -91,12 +113,13 @@ bool GrpcRetrievalClient::Healthy() {
         HealthRequest req;
         HealthResponse resp;
         auto ctx = MakeContext();
-        if (impl_->stub->Health(ctx.get(), req, &resp).ok() &&
-            resp.status() == "ok") {
+        const grpc::Status st = impl_->stub->Health(ctx.get(), req, &resp);
+        if (st.ok() && resp.status() == "ok") {
             healthy_ = true;
             return true;
         }
         // gRPC down: report the HTTP fallback's health instead.
+        WarnGrpcFallback("Health", st);
     }
     return RetrievalClient::Healthy();
 }
@@ -121,7 +144,8 @@ std::optional<nlohmann::json> GrpcRetrievalClient::SearchDeals(
 
         RetrieveDealsResponse resp;
         auto ctx = MakeContext();
-        if (impl_->stub->RetrieveDeals(ctx.get(), req, &resp).ok()) {
+        const grpc::Status st = impl_->stub->RetrieveDeals(ctx.get(), req, &resp);
+        if (st.ok()) {
             nlohmann::json out;
             out["total"] = resp.total();
             out["items"] = nlohmann::json::array();
@@ -136,6 +160,7 @@ std::optional<nlohmann::json> GrpcRetrievalClient::SearchDeals(
             return out;
         }
         // fall through to HTTP
+        WarnGrpcFallback("RetrieveDeals", st);
     }
     return RetrievalClient::SearchDeals(filters);
 }
@@ -148,7 +173,8 @@ std::optional<nlohmann::json> GrpcRetrievalClient::SearchKb(
         req.set_top_k(top_k);
         RetrieveKbResponse resp;
         auto ctx = MakeContext();
-        if (impl_->stub->RetrieveKb(ctx.get(), req, &resp).ok()) {
+        const grpc::Status st = impl_->stub->RetrieveKb(ctx.get(), req, &resp);
+        if (st.ok()) {
             nlohmann::json out;
             out["passages"] = nlohmann::json::array();
             for (const auto& p : resp.passages()) {
@@ -165,6 +191,7 @@ std::optional<nlohmann::json> GrpcRetrievalClient::SearchKb(
             }
             return out;
         }
+        WarnGrpcFallback("RetrieveKb", st);
     }
     return RetrievalClient::SearchKb(query, top_k);
 }

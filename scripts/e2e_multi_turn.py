@@ -526,7 +526,6 @@ def scenario_s8_ratelimit(tmp, procs):
 
 
 def scenario_s6_observability(obs_db):
-
     """Audit trail: one rec_logs row per request, llm_calls per LLM call,
     and the /v1/metrics aggregate (feedback joined via ATTACH)."""
     section("S6 观测落库（recommendation_logs / llm_calls / metrics）")
@@ -566,6 +565,35 @@ def scenario_s6_observability(obs_db):
           abs(fb.get("satisfaction", -1) - 0.5) < 1e-9,
           str(fb))
     check("S6.metrics.llm_total", m.get("llm", {}).get("total_calls") == 8)
+
+
+def scenario_s9_guard_payloads(obs_db):
+    """Phase 4-D: the ready-made injection/banned payloads (scripts/*.json)
+    against the main instance — blocked politely, and the guard intervention
+    lands in recommendation_logs.guard_action/guard_detail (Phase 4-C)."""
+    section("S9 输入护栏 payload(test_injection/test_banned)")
+
+    cols = {r[1] for r in db_query(obs_db, "PRAGMA table_info(recommendation_logs)")}
+    check("S9.guard_columns", {"guard_action", "guard_detail"} <= cols, str(cols))
+
+    for name, risk in (("test_injection", "prompt_injection"),
+                       ("test_banned", "banned_topic")):
+        with open(os.path.join(ROOT, "scripts", f"{name}.json"),
+                  encoding="utf-8") as f:
+            payload = json.load(f)
+        status, r = post_json_status(f"{API}/v1/chat", payload)
+        check(f"S9.{name}.http200", status == 200, f"got {status}")
+        check(f"S9.{name}.blocked", r.get("next_state") == "BLOCKED", str(r)[:200])
+        check(f"S9.{name}.polite_refusal", r.get("reply", "").startswith("抱歉"),
+              r.get("reply", ""))
+        check(f"S9.{name}.no_items", r.get("items") == [])
+        rows = db_query(obs_db,
+            "SELECT guard_action, guard_detail FROM recommendation_logs "
+            "ORDER BY rowid DESC LIMIT 1")
+        check(f"S9.{name}.guard_action",
+              rows and rows[0][0] == "refuse_input", str(rows))
+        check(f"S9.{name}.guard_detail",
+              rows and risk in (rows[0][1] or ""), str(rows))
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +699,7 @@ def main():
             scenario_s3_after_restart(db_path, sid, before)
             scenario_s4_guard(db_path, sid)
             scenario_s6_observability(obs_db)
+            scenario_s9_guard_payloads(obs_db)
             scenario_s7_auth(tmp, procs)
             scenario_s8_ratelimit(tmp, procs)
         else:

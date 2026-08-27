@@ -207,6 +207,9 @@ $env:SESSION_STORE="memory"
 
 - **输入拦截**（规划前）：检测 prompt 注入（中英文越狱话术）、违禁话题、超长输入；命中则短路返回礼貌拒绝，`next_state="BLOCKED"`。
 - **输出脱敏**（返回前）：掩码手机号 / 邮箱 / 身份证 / 16–19 位数字串，过滤违禁词（`***`），作用于回复正文与商品 title/reason/tags。
+- **输出事实校验**（Phase 4，compose 后）：抽取回复中的货币断言（`¥xx`/`xx元`）与折扣断言（`xx折`），与候选商品的 `price`/`original_price` 精确比对；人均（price/人数）与总价（price×人数，人数取商品自身 [min_people,max_people] 区间）为合法派生不误杀；折扣按 price/original×10 ±0.5 容差。违规时编造回复**不发出**：非流式回退模板（`compose_mode=template_guard_fallback`），流式在尾部发 additive 的 `replace` SSE 事件整体纠偏（`compose_mode=llm_stream_guard_fallback`，旧前端忽略不崩）。
+- **规则外置**（Phase 4-C）：违禁词/注入模式/违禁话题/输入长度阈值在 [data/guard_rules.json](data/guard_rules.json)，缺文件或损坏时回退内置默认（与内置逐字节一致）；`GUARD_RULES_PATH` 可改路径。
+- **Guard 可观测**（Phase 4-C）：`recommendation_logs` 幂等加列 `guard_action`（refuse_input/sanitized/fact_violation）+ `guard_detail`（违规摘要），`evaluate.py` 有「Guard 动作」段（分布、fact_violation 率、明细）。
 
 构造 `AgentOrchestrator` 时传 `SafetyGuard` 即启用，传 `nullptr` 则跳过（默认参数，不破坏现有调用）。规则集见 [include/agent/safety_guard.hpp](include/agent/safety_guard.hpp) 与 [src/agent/safety_guard.cpp](src/agent/safety_guard.cpp)；单测见 [tests/test_safety_guard.cpp](tests/test_safety_guard.cpp)。
 
@@ -239,10 +242,13 @@ HTTP**。契约 `proto/retrieval.proto` 逐字段镜像 HTTP 形状;一致性由
 `OBS_DB_PATH` 可改），`trace_id` 串联两表：
 
 - `recommendation_logs`：trace_id / session_id / 请求文本 / action / 槽位 / Top5 商品+分数 /
-  回复 / grounding 数 / compose_mode（llm_stream·llm·template·short_circuit·none）/ 端到端延迟。
+  回复 / grounding 数 / compose_mode（llm_stream·llm·template·short_circuit·none，
+  guard 介入时另有 template_guard_fallback·llm_stream_guard_fallback）/ 端到端延迟 /
+  guard_action·guard_detail（Phase 4-C）。
 - `llm_calls`：trace_id / purpose（plan·compose）/ model / prompt+completion tokens / 延迟 /
-  status / attempt（planner 重试序号）。**流式 compose 行 tokens 记 0**（上游未开
-  `stream_options.include_usage`，属口径而非丢失）。
+  status / attempt（planner 重试序号）。流式 compose 行的 tokens 来自尾部 SSE
+  usage chunk（网关已请求 `stream_options.include_usage`，Phase 2.3-A 起按真实
+  usage 落库；上游不给 usage 时如实记 0）。
 
 聚合指标：`GET /v1/metrics`（请求分布、FALLBACK 率、空推荐率、avg/p95 延迟、LLM 调用与
 token 汇总、ATTACH 会话库算反馈满意率）。
@@ -366,6 +372,7 @@ data: {"event":"final","data":{"session_id":"...","reply":"...","items":[...]}}
 | `grounding` | 知识库命中（`passage_count`），仅 kb_search 有结果时出现 |
 | `composing` | 正在生成回复 |
 | `delta` | **token 级增量**，`data.content` 为一段文本片段，拼起来即完整回复 |
+| `replace` | （Phase 4-B，additive）事实校验在流式输出完成后发现违规，`data.content` 为模板兜底回复，整体替换此前 delta 拼出的文本；旧前端忽略不崩 |
 | `final` | 完整 `RecommendationResult`（与 `/v1/chat` 返回一致）|
 | `error` | 处理异常 |
 
