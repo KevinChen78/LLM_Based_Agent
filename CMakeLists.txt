@@ -60,13 +60,14 @@ if(WIN32)
 endif()
 
 # -----------------------------------------------------------------------------
-# Generated protobuf/grpc sources (Phase 0: keep proto definitions, generation optional)
+# gRPC inter-service pilot (Phase 5-C). OFF by default: when OFF nothing below
+# is configured and the build is byte-identical to before. The HTTP JSON
+# contract surface stays frozen; gRPC is a parallel pilot for retrieval only.
 # -----------------------------------------------------------------------------
-# find_package(Protobuf CONFIG QUIET)
-# find_package(gRPC CONFIG QUIET)
-# if(Protobuf_FOUND AND gRPC_FOUND)
-#     add_subdirectory(proto)
-# endif()
+option(ENABLE_GRPC "FetchContent gRPC + proto codegen for the retrieval pilot" OFF)
+if(ENABLE_GRPC)
+    add_subdirectory(proto)
+endif()
 
 # -----------------------------------------------------------------------------
 # Core library

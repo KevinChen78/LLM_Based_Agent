@@ -1,0 +1,90 @@
+// Phase 5-C/D: inter-service gRPC contract for retrieval_service.
+//
+// Field-for-field mirror of the existing HTTP JSON contract
+// (/v1/health, /v1/retrieve/deals, /v1/retrieve/kb) — no new semantics.
+// The HTTP JSON surface stays frozen; gRPC runs as a parallel pilot and any
+// gRPC failure falls back to the HTTP client (see GrpcRetrievalClient).
+//
+// Presence semantics: HTTP distinguishes "absent" from "0" for numeric
+// filters (e.g. max_price=0 filters everything, absent = no limit), so those
+// fields are proto3 `optional` to preserve exact behaviour.
+
+syntax = "proto3";
+
+package groupbuy.retrieval.v1;
+
+service RetrievalService {
+    rpc Health(HealthRequest) returns (HealthResponse);
+    rpc RetrieveDeals(RetrieveDealsRequest) returns (RetrieveDealsResponse);
+    rpc RetrieveKb(RetrieveKbRequest) returns (RetrieveKbResponse);
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+    string status = 1;
+    repeated string corpora = 2;
+    int64 deal_count = 3;
+    int64 kb_count = 4;
+    string backend = 5;
+    string vector = 6;          // "on" | "off"
+    string tokenizer = 7;
+    string vector_model = 8;    // present only when vector = "on"
+}
+
+message RetrieveDealsRequest {
+    string city = 1;
+    string district = 2;
+    string category = 3;
+    string query = 4;                  // keywords / free text
+    optional double max_price = 5;     // absent = no upper limit
+    optional double min_price = 6;     // absent = no lower limit
+    optional int32 people = 7;
+    optional int32 top_k = 8;          // absent = service default (20)
+}
+
+message DealItem {
+    string item_id = 1;
+    string title = 2;
+    string category = 3;
+    string city = 4;
+    string district = 5;
+    double price = 6;
+    double original_price = 7;
+    double rating = 8;
+    int64 sold_count = 9;
+    double score = 10;
+    repeated string tags = 11;
+    string description = 12;
+    string merchant_id = 13;
+    int32 min_people = 14;
+    int32 max_people = 15;
+}
+
+message RetrieveDealsResponse {
+    repeated DealItem items = 1;
+    int64 total = 2;                   // survivors before top_k truncation
+    // Phase 3-C relaxation audit — set only when the chain actually fired
+    // (mirrors the HTTP additive-field rule).
+    optional int32 relaxed_level = 3;
+    string effective_category = 4;
+}
+
+message RetrieveKbRequest {
+    string query = 1;
+    optional int32 top_k = 2;          // absent = service default (3)
+}
+
+message KbPassage {
+    string id = 1;
+    string category = 2;
+    string title = 3;
+    string content = 4;
+    string source = 5;
+    double score = 6;
+    repeated string tags = 7;
+}
+
+message RetrieveKbResponse {
+    repeated KbPassage passages = 1;
+}
