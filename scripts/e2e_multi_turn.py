@@ -78,23 +78,42 @@ def section(title):
 # ---------------------------------------------------------------------------
 # HTTP helpers (stdlib urllib; Chinese payloads must go through json.dumps)
 # ---------------------------------------------------------------------------
-def post_json(url, payload, timeout=30):
-    status, body = post_json_status(url, payload, timeout)
+def post_json(url, payload, timeout=30, headers=None):
+    status, body = post_json_status(url, payload, timeout, headers=headers)
     if status != 200:
         raise RuntimeError(f"POST {url} -> HTTP {status}: {body}")
     return status, body
 
 
-def post_json_status(url, payload, timeout=30):
+def post_json_status(url, payload, timeout=30, headers=None):
     """Like post_json but returns (status, body) for any HTTP status."""
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    hdrs = {"Content-Type": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode("utf-8"))
+
+
+def get_status(url, timeout=5, headers=None):
+    """GET returning (status, body); body is parsed JSON when possible,
+    otherwise the raw text (static assets are not JSON)."""
+    req = urllib.request.Request(url, headers=headers or {}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8")
+        status = e.code
+    try:
+        return status, json.loads(raw)
+    except json.JSONDecodeError:
+        return status, raw
 
 
 def get_json(url, timeout=5):
@@ -172,7 +191,7 @@ def api_server_exe():
 
 
 def start_api_server(db_path, log_path, llm_base_url="", retrieval_url="",
-                     obs_db_path=""):
+                     obs_db_path="", port=8080, extra_env=None):
     env = dict(os.environ)
     # Empty-string values are passed through by CreateProcess and read by the
     # CRT as present-but-empty, which is exactly how api_server enables the
@@ -181,13 +200,19 @@ def start_api_server(db_path, log_path, llm_base_url="", retrieval_url="",
     env["RETRIEVAL_SERVICE_URL"] = retrieval_url
     env["SESSION_STORE"] = "sqlite"
     env["SESSION_DB_PATH"] = db_path
+    env["AGENT_PORT"] = str(port)
+    # Pin auth/rate-limit off so a developer's exported env can never leak
+    # into the regression; the auth tier re-enables them via extra_env.
+    env["AGENT_API_KEYS"] = ""
     if obs_db_path:
         env["OBS_DB_PATH"] = obs_db_path
+    if extra_env:
+        env.update(extra_env)
     log = open(log_path, "w", encoding="utf-8")
     proc = subprocess.Popen(
         [api_server_exe()], cwd=ROOT, env=env,
         stdout=log, stderr=subprocess.STDOUT)
-    if wait_health(f"{API}/v1/health") is None:
+    if wait_health(f"http://127.0.0.1:{port}/v1/health") is None:
         proc.terminate()
         raise RuntimeError(
             f"api_server did not become healthy; see log: {log_path}")
@@ -393,6 +418,57 @@ def scenario_s4_guard(db_path, sid):
     check("S4.session_alive", status == 200 and r2.get("session_id") == sid)
 
 
+def scenario_s7_auth(tmp, procs):
+    """Phase 5-A: API key auth on a second instance (port 8081).
+
+    The main instance runs with AGENT_API_KEYS="" (disabled) throughout, so
+    the 51 baseline checks are unaffected; this tier proves the enabled path:
+    no key -> 401, wrong key -> 401, right key -> 200, health exempt.
+    """
+    section("S7 API key 鉴权(独立实例 :8081)")
+    if port_open(8081):
+        raise RuntimeError("port 8081 is already in use (auth tier needs it)")
+    base = "http://127.0.0.1:8081"
+    proc, log = start_api_server(
+        os.path.join(tmp, "auth.db"), os.path.join(tmp, "api_auth.log"),
+        obs_db_path=os.path.join(tmp, "auth_obs.db"),
+        port=8081, extra_env={"AGENT_API_KEYS": "test-key"})
+    procs.append((proc, log))
+
+    payload = {"user_id": "e2e-auth", "message": "我想吃海鲜"}
+
+    status, body = post_json_status(f"{base}/v1/chat", payload)
+    check("S7.no_key_401", status == 401, f"{status} {body}")
+    check("S7.no_key_body",
+          status == 401 and "error" in body and
+          str(body.get("trace_id", "")).startswith("t-"), str(body))
+
+    status, _ = post_json_status(f"{base}/v1/chat", payload,
+                                 headers={"X-Api-Key": "wrong-key"})
+    check("S7.wrong_key_401", status == 401, f"got {status}")
+
+    status, body = post_json_status(f"{base}/v1/chat", payload,
+                                    headers={"X-Api-Key": "test-key"})
+    check("S7.right_key_200", status == 200, f"{status} {str(body)[:120]}")
+
+    status, body = post_json_status(f"{base}/v1/chat/stream", payload)
+    check("S7.stream_no_key_401", status == 401, f"got {status}")
+
+    status, body = post_json_status(f"{base}/v1/feedback", {
+        "session_id": "s", "feedback_type": "like"})
+    check("S7.feedback_no_key_401", status == 401, f"got {status}")
+
+    status, _ = get_status(f"{base}/v1/metrics")
+    check("S7.metrics_no_key_401", status == 401, f"got {status}")
+
+    status, body = get_status(f"{base}/v1/health")
+    check("S7.health_exempt",
+          status == 200 and body.get("status") == "ok", f"{status} {body}")
+
+    status, _ = get_status(f"{base}/index.html")
+    check("S7.static_exempt", status == 200, f"got {status}")
+
+
 def scenario_s6_observability(obs_db):
     """Audit trail: one rec_logs row per request, llm_calls per LLM call,
     and the /v1/metrics aggregate (feedback joined via ATTACH)."""
@@ -538,6 +614,7 @@ def main():
             scenario_s3_after_restart(db_path, sid, before)
             scenario_s4_guard(db_path, sid)
             scenario_s6_observability(obs_db)
+            scenario_s7_auth(tmp, procs)
         else:
             # Real tier: gateway must be up with a key; reuse or start it.
             gw_health = None

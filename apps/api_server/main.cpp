@@ -5,6 +5,7 @@
 #include "coro/coro.hpp"
 
 #include "agent/agent_orchestrator.hpp"
+#include "agent/api_auth.hpp"
 #include "agent/deal_catalog.hpp"
 #include "agent/deal_tools.hpp"
 #include "agent/llm_client.hpp"
@@ -23,6 +24,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
@@ -260,6 +262,25 @@ int main() {
     auto orchestrator = std::make_shared<AgentOrchestrator>(
         planner, tools, memory, llm, composer, guard, obs, profiles, catalog);
 
+    // API key auth (Phase 5-A). AGENT_API_KEYS empty/unset => disabled and
+    // every request passes, byte-identical to before. /v1/health and the
+    // static assets are intentionally exempt (health-check convention).
+    ApiAuth api_auth = ApiAuth::FromEnv();
+    std::cout << "API auth: " << (api_auth.Enabled() ? "enabled (AGENT_API_KEYS)"
+                                                     : "disabled (set AGENT_API_KEYS to enable)")
+              << std::endl;
+    // Reject helper: shared 401 shape for all protected endpoints.
+    auto require_auth = [&api_auth](const Request& req, Response& resp) -> bool {
+        if (api_auth.Check(req.header("X-Api-Key"))) return true;
+        static std::atomic<int> auth_counter{0};
+        auto now = std::chrono::system_clock::now().time_since_epoch().count();
+        resp.status(coro::net::http::Status::Unauthorized)
+            .json(json{{"error", "missing or invalid API key"},
+                       {"trace_id", "t-" + std::to_string(now) + "-auth" +
+                                        std::to_string(++auth_counter)}}.dump());
+        return false;
+    };
+
     // Web UI static assets. Served from WEB_DIR (default "web", relative to
     // cwd) on the same origin as the API, so no CORS is needed. The coro
     // router matches exact keys, so each file has its own GET route.
@@ -268,10 +289,15 @@ int main() {
     std::cout << "Web UI: " << web_dir << "/ (served at /)" << std::endl;
 
     ThreadPool pool(4);
-    Server server(pool, 8080);
+    // AGENT_PORT (default 8080): lets a second instance run alongside the
+    // main one (the e2e auth/rate-limit tiers use this).
+    const char* port_env = std::getenv("AGENT_PORT");
+    int port = port_env && *port_env ? std::atoi(port_env) : 8080;
+    Server server(pool, static_cast<uint16_t>(port));
 
     server
-        .post("/v1/chat", [orchestrator](const Request& req, Response& resp) -> Task<void> {
+        .post("/v1/chat", [orchestrator, require_auth](const Request& req, Response& resp) -> Task<void> {
+            if (!require_auth(req, resp)) co_return;
             try {
                 auto body = json::parse(req.body());
                 UserContext ctx;
@@ -296,7 +322,8 @@ int main() {
             }
             co_return;
         })
-        .post("/v1/chat/stream", [orchestrator](const Request& req, Response& resp) -> Task<void> {
+        .post("/v1/chat/stream", [orchestrator, require_auth](const Request& req, Response& resp) -> Task<void> {
+            if (!require_auth(req, resp)) co_return;
             try {
                 auto body = json::parse(req.body());
                 UserContext ctx;
@@ -337,7 +364,8 @@ int main() {
             }
             co_return;
         })
-        .post("/v1/feedback", [memory](const Request& req, Response& resp) -> Task<void> {
+        .post("/v1/feedback", [memory, require_auth](const Request& req, Response& resp) -> Task<void> {
+            if (!require_auth(req, resp)) co_return;
             try {
                 auto body = json::parse(req.body());
                 SessionMemoryStore::FeedbackRecord rec;
@@ -377,7 +405,8 @@ int main() {
             resp.json(json{{"status", "ok"}}.dump());
             co_return;
         })
-        .get("/v1/metrics", [obs, sessions_db_path](const Request& req, Response& resp) -> Task<void> {
+        .get("/v1/metrics", [obs, sessions_db_path, require_auth](const Request& req, Response& resp) -> Task<void> {
+            if (!require_auth(req, resp)) co_return;
             try {
                 resp.json(obs->Aggregate(sessions_db_path).dump());
             } catch (const std::exception& e) {
@@ -406,11 +435,11 @@ int main() {
         });
 
     if (!server.bind("0.0.0.0")) {
-        std::cerr << "Failed to bind to port 8080" << std::endl;
+        std::cerr << "Failed to bind to port " << port << std::endl;
         return 1;
     }
 
-    std::cout << "LLM Agent API server starting on http://0.0.0.0:8080" << std::endl;
+    std::cout << "LLM Agent API server starting on http://0.0.0.0:" << port << std::endl;
     std::cout << "Routes:" << std::endl;
     for (const auto& route : server.router().list_routes()) {
         std::cout << "  " << route << std::endl;
