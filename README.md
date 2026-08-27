@@ -289,7 +289,7 @@ rowid | session_id(FK→sessions) | trace_id | item_id(空=整条回复) | feedb
 
 默认后端是**真实目录驱动的召回 + 多因子排序**，替代了 Phase 0 的写死 Mock 数据：
 
-- `DealCatalog`（[include/agent/deal_catalog.hpp](include/agent/deal_catalog.hpp)）：从 `data/deals.json` 加载团购商品（5320 条，覆盖 8 城——武汉 5000 条 + 深圳/北京/上海各 100 条生成数据，由 `scripts/gen_wuhan_deals.py` 与 `scripts/gen_city_deals.py` 确定性生成、幂等重跑），文件缺失/不可读时自动回退到内置兜底数据集（8 条），保证离线和单测环境也能跑。
+- `DealCatalog`（[include/agent/deal_catalog.hpp](include/agent/deal_catalog.hpp)）：从 `data/deals.json` 加载团购商品（9713 条——武汉 5000 条 + 深圳/北京/上海合成数据由 `scripts/gen_wuhan_deals.py` 与 `scripts/gen_city_deals.py` 确定性生成，**深圳南山区 4394 条为真实商户**（高德 POI，`scripts/fetch_pois.py` 拉取 + `scripts/gen_poi_deals.py` 合成团购属性，详见 [docs/phase7_poi_data.md](docs/phase7_poi_data.md)）），文件缺失/不可读时自动回退到内置兜底数据集（8 条），保证离线和单测环境也能跑。
 - `DealRetriever`（工具名 `deal_retriever`）：按 `city / category / district / max_price / min_price / people / keywords / top_k` 过滤，再按**相关性打分**（关键词命中 + 评分 + 折扣）排序并截断 `top_k`；`people` 会匹配套餐的 `min_people/max_people` 区间。
 - `DealRanker`（工具名 `deal_ranker`）：对召回候选做多因子重排 `0.35·评分 + 0.25·销量归一 + 0.25·价格契合 + 0.15·折扣`，可选 `taboo` 禁忌词过滤、`budget` 对超预算项大幅扣分，取 `top_n`。
 
@@ -465,7 +465,7 @@ $env:RETRIEVAL_SERVICE_URL="http://localhost:8001"
 ### 服务契约
 
 ```text
-GET  /v1/health          -> {"status":"ok","deal_count":5320,"kb_count":22,"backend":"postgres|json",
+GET  /v1/health          -> {"status":"ok","deal_count":9713,"kb_count":22,"backend":"postgres|json",
                              "vector":"on|off","vector_model":"BAAI/bge-small-zh-v1.5"}
 POST /v1/retrieve/deals  body {"query","city","category","district","max_price","min_price","people","top_k"}
                      -> {"items":[<完整 deal>+score], "total":N}

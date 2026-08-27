@@ -33,6 +33,7 @@ Usage:
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -101,7 +102,8 @@ def fetch_page(key, city, typecode, page, around=None, radius=10000):
     around="lng,lat" switches to /v3/place/around (circle search); the cache
     key namespaced `around_<city>_...` never collides with text-search pages.
     """
-    tag = f"around_{city}" if around else city
+    tag = ("around_" + around.replace(",", "_").replace(".", "d")
+           if around else city)
     path = cache_path(tag, typecode, page)
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
@@ -174,6 +176,12 @@ def main():
     ap.add_argument("--district", default="",
                     help="keep only POIs whose adname equals this district "
                          "(e.g. 南山区); around mode only")
+    ap.add_argument("--grid", default="", metavar="MINLNG,MINLAT,MAXLNG,MAXLAT",
+                    help="grid of around-search centers covering this bbox "
+                         "(use with --step/--radius; overrides --around)")
+    ap.add_argument("--step", type=float, default=2000.0,
+                    help="grid center spacing in meters (default 2000; "
+                         "choose <= sqrt(2)*radius for overlap-free-ish cover)")
     ap.add_argument("--out", default="",
                     help="output path (default data/pois_raw.json; around "
                          "mode defaults to data/pois_<district>.json)")
@@ -197,7 +205,24 @@ def main():
     stop = False
 
     # Task list: (city_label, around_center_or_None)
-    if args.around:
+    if args.grid:
+        min_lng, min_lat, max_lng, max_lat = (
+            float(x) for x in args.grid.split(","))
+        lat0 = (min_lat + max_lat) / 2.0
+        dlat = args.step / 111000.0
+        dlng = args.step / (111000.0 * math.cos(math.radians(lat0)))
+        centers = []
+        lat = min_lat
+        while lat <= max_lat + 1e-9:
+            lng = min_lng
+            while lng <= max_lng + 1e-9:
+                centers.append("{0:.5f},{1:.5f}".format(lng, lat))
+                lng += dlng
+            lat += dlat
+        print("grid: {0} 个中心点 (step={1}m, radius={2}m)".format(
+            len(centers), args.step, args.radius))
+        tasks = [(args.city, c) for c in centers]
+    elif args.around:
         tasks = [(args.city, args.around)]
     else:
         tasks = [(c, None) for c in CITIES]
@@ -253,12 +278,13 @@ def main():
 
     out_path = args.out or (
         os.path.join(ROOT, "data", f"pois_{args.district}.json")
-        if args.around and args.district else OUT_PATH)
+        if (args.around or args.grid) and args.district else OUT_PATH)
     out = {
-        "source": ("amap /v3/place/around" if args.around
+        "source": ("amap /v3/place/around" if (args.around or args.grid)
                    else "amap /v3/place/text") + " (personal demo use only)",
         "cities": [t[0] for t in tasks],
         "around": args.around or None,
+        "grid": args.grid or None,
         "district_filter": args.district or None,
         "types": TYPES,
         "count": len(pois),

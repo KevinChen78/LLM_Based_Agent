@@ -34,7 +34,8 @@ python scripts/evaluate.py
 ```
 
 数据变更流程:改/跑生成器(`scripts/gen_wuhan_deals.py`、`gen_city_deals.py`、
-`gen_knowledge.py`,均确定性幂等)→ `python scripts/pg_seed.py` 同步到 PG →
+`gen_knowledge.py`、`gen_poi_deals.py`(Phase 7 真实 POI,需先跑
+`fetch_pois.py`,南山区独家真实商户),均确定性幂等)→ `python scripts/pg_seed.py` 同步到 PG →
 `python scripts/pg_embed.py` 给新增行补向量 →
 重启 retrieval_service(BM25 语料与向量通道状态都是启动时构建,不热加载)。
 
@@ -116,7 +117,7 @@ fastembed 首次加载模型需下载 ~100MB,国内网络要
 
 **测试注意**:`tests/test_deals_tools.cpp` 读真实 `data/deals.json`——计数断言
 从 catalog 动态推导(FiltersWuhanFromCatalog),重新生成数据不会破坏它;
-`tests/test_deal_catalog_pg.cpp` 硬编码 5320 条,改数据规模需同步。
+`tests/test_deal_catalog_pg.cpp` 硬编码 9713 条,改数据规模需同步。
 CTest 已固定 `WORKING_DIRECTORY=项目根`(tests/CMakeLists.txt),
 `RUN_TESTS`/直接跑 test_agent.exe 行为一致。
 

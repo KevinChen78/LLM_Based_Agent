@@ -39,13 +39,13 @@ pip install -r requirements.txt
 python scripts/pg_seed.py
 ```
 
-期望输出:`deals: 5320 synced ... merchants: 5320 synced ... kb: 22 synced ...`
+期望输出:`deals: 9713 synced ... merchants: 9713 synced ... kb: 22 synced ...`
 
 抽查:
 
 ```
 psql -U agent -d groupbuy -c "SELECT count(*) FROM groupbuy_items; SELECT count(*) FROM merchants; SELECT count(*) FROM kb_passages;"
--- 期望: 5320 / 5320 / 22
+-- 期望: 9713 / 9713 / 22
 ```
 
 ## 4. 配置 retrieval_service
@@ -65,10 +65,10 @@ PG_DSN=host=127.0.0.1 port=5432 dbname=groupbuy user=agent password=<第2步的�
 
 ```powershell
 python retrieval_service/main.py
-# 期望 banner: backend=postgres  deals=5320  kb=22
+# 期望 banner: backend=postgres  deals=9713  kb=22
 
 curl http://localhost:8001/v1/health
-# 期望包含 "backend":"postgres", "deal_count":5320
+# 期望包含 "backend":"postgres", "deal_count":9713
 ```
 
 若 PG 未启动/未播种/缺 psycopg,服务会打印 WARNING 并降级为 `backend=json`
@@ -78,7 +78,7 @@ curl http://localhost:8001/v1/health
 
 ```powershell
 python scripts/test_pg_retrieval.py
-# 期望: PASS: all 20 cases identical across backends (deals=5320, kb=22)
+# 期望: PASS: all 20 cases identical across backends (deals=9713, kb=22)
 # 无 PG 环境时打印 SKIP 并退出 0,不阻塞开发
 ```
 
@@ -125,7 +125,7 @@ python scripts/pg_embed.py           # 首次下载模型 ~100MB
 
 ```powershell
 python retrieval_service/main.py
-# banner 应有: vector channel on (BAAI/bge-small-zh-v1.5, 5320 embeddings)
+# banner 应有: vector channel on (BAAI/bge-small-zh-v1.5, 9713 embeddings)
 curl http://localhost:8001/v1/health
 # 应有 "vector":"on", "vector_model":"BAAI/bge-small-zh-v1.5"
 
