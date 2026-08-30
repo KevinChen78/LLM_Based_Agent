@@ -114,7 +114,7 @@ tool_calls 必须先包含召回调用：
     "max_price": 300,
     "people": 3,
     "keywords": "",
-    "top_k": 20
+    "top_k": 100
   }
 }
 若有预算/人数/禁忌需要精排，可再追加（candidates 留空即可，系统会自动注入召回结果）：

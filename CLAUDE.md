@@ -82,6 +82,12 @@ JSON 容错解析 + 温度 0 重试)→ 工具注册表(`DealRetriever`/`DealRan
 `KnowledgeRetriever`)→ `ResponseComposer`(流式 LLM/模板/短路三种 compose_mode)。
 协程是 `coro::Task<T>`(本地库 `../coro`),同步测试里用 `.result()` 驱动。
 
+**两级排序(Phase 8-D)**:召回(DealRetriever,top_k 默认 100,纯召回层)
+→ **粗排**(DealRanker 内规则分显式化为粗排层:taboo 剔除→规则分排序→截
+kCoarseTopK=50)→ **精排**(ranking_service LightGBM 重排这 50 条,截 top_n;
+off/挂/无模型→粗排名次直接截 top_n,语义同旧"规则分兜底")。rank_in_rules
+特征语义=粗排名次(features.py 注释对齐,特征值不变免重训)。
+
 **关键设计模式**:
 
 - **降级链**:每一层外部依赖都有本地兜底——网关挂→C++ 内置 stub;

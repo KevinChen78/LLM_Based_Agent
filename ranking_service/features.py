@@ -31,7 +31,9 @@ FEATURE_NAMES = [
     "price_fit",                # same formula as the C++ rule ranker
     "category_match",           # context.category == item.category
     "city_match",               # context.city == item.city
-    "rank_in_rules",            # rule-score rank / (n-1); 0 = best
+    "rank_in_rules",            # coarse-rank position / (n-1); 0 = best
+                                # (Phase 8-D: rule score is the explicit coarse
+                                # stage, so this IS the coarse rank)
     # stats (item_features; cold start => neutral)
     "like_rate",                # (likes + 1) / (impressions + 2)
     "dislike_rate",             # dislikes / (impressions + 2)

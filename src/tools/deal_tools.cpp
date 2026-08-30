@@ -151,7 +151,7 @@ std::string DealRetriever::SchemaJson() const {
                 "min_price": {"type": "number", "description": "套餐总价下限，默认 0"},
                 "people": {"type": "integer", "description": "人数，用于匹配套餐人数区间"},
                 "keywords": {"type": "string", "description": "关键词，空格或逗号分隔，如 龙虾 包间"},
-                "top_k": {"type": "integer", "default": 20}
+                "top_k": {"type": "integer", "default": 100}
             }
         }
     })";
@@ -174,8 +174,11 @@ coro::Task<ToolResult> DealRetriever::Execute(const ToolCall& call) {
         if (max_price <= 0.0) max_price = 1e9;
         int people = ArgInt(args, "people", 0);
         std::string keywords = ArgStr(args, "keywords");
-        int top_k = ArgInt(args, "top_k", 20);
-        if (top_k <= 0) top_k = 20;
+        // Phase 8-D: recall budget widened 20 -> 100 — the retriever is now a
+        // pure recall layer feeding the coarse ranker (DealRanker), so a
+        // larger pool is intentional. Service-side pool_n follows top_k*4.
+        int top_k = ArgInt(args, "top_k", 100);
+        if (top_k <= 0) top_k = 100;
 
         // Optional BM25 semantic retrieval via the retrieval service. When the
         // service is configured and healthy we delegate the text-relevance
@@ -371,6 +374,16 @@ coro::Task<ToolResult> DealRanker::Execute(const ToolCall& call) {
             scored.push_back({c, RuleScore(c, budget, max_sold), 0.0, false});
         }
 
+        // Coarse rank (Phase 8-D): the rule score is now an explicit first
+        // stage — taboo removal (above) -> rule-score sort -> truncate to
+        // kCoarseTopK. The fine stage (LightGBM) re-ranks only this set;
+        // rank_in_rules semantics == position in this coarse order.
+        constexpr size_t kCoarseTopK = 50;
+        std::stable_sort(scored.begin(), scored.end(),
+            [](const Scored& a, const Scored& b) { return a.rule_score > b.rule_score; });
+        const size_t pre_coarse = scored.size();
+        if (scored.size() > kCoarseTopK) scored.resize(kCoarseTopK);
+
         // Experiment decision (off mode => no service call at all).
         const bool use_model = ranker_ && ranker_->Enabled() &&
                                experiment_.UseModel(user_id);
@@ -380,11 +393,11 @@ coro::Task<ToolResult> DealRanker::Execute(const ToolCall& call) {
         std::string model_version;
         bool model_served = false;
 
-        if ((use_model || want_shadow) && !filtered.empty()) {
-            constexpr size_t kMaxModelCandidates = 50;  // bound the POST body
+        if ((use_model || want_shadow) && !scored.empty()) {
+            // Fine-rank input = the coarse-truncated set (order = coarse rank).
             nlohmann::json model_candidates = nlohmann::json::array();
-            for (size_t i = 0; i < filtered.size() && i < kMaxModelCandidates; ++i) {
-                model_candidates.push_back(filtered[i]);
+            for (const auto& s : scored) {
+                model_candidates.push_back(s.deal);
             }
             nlohmann::json req = {
                 {"candidates", model_candidates},
@@ -428,10 +441,9 @@ coro::Task<ToolResult> DealRanker::Execute(const ToolCall& call) {
                     if (a.model_score != b.model_score) return a.model_score > b.model_score;
                     return a.rule_score > b.rule_score;
                 });
-        } else {
-            std::stable_sort(scored.begin(), scored.end(),
-                [](const Scored& a, const Scored& b) { return a.rule_score > b.rule_score; });
         }
+        // Rule/fallback path: scored is already in coarse order (rule-score
+        // sorted, truncated) — no re-sort needed.
 
         nlohmann::json out_items = nlohmann::json::array();
         for (size_t i = 0; i < scored.size() && static_cast<int>(i) < top_n; ++i) {
@@ -469,7 +481,7 @@ coro::Task<ToolResult> DealRanker::Execute(const ToolCall& call) {
         result.success = true;
         nlohmann::json out;
         out["items"] = out_items;
-        out["total"] = scored.size();
+        out["total"] = pre_coarse;   // survivors before coarse truncation
         out["rank_audit"] = rank_audit;
         result.result_json = out.dump();
         spdlog::info("deal_ranker: budget={}, taboo='{}', mode={}, group={} -> {}/{} kept",

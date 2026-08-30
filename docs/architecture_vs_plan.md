@@ -20,6 +20,7 @@
 | API 鉴权/限流/Trace | API key(恒定时间比较)+ 内存令牌桶(429+Retry-After)+ 全链路 trace_id | [docs/phase5_auth_grpc.md](phase5_auth_grpc.md) |
 | A/B 实验 | ExperimentManager FNV-1a(user_id)%100 分桶,RANKER_MODE=off/shadow/active | [src/agent/experiment_manager.cpp](../src/agent/experiment_manager.cpp) |
 | 反馈闭环(like/dislike 回流排序) | feedback 表 → build_features.py → train_ranker.py(LightGBM LambdaRank)→ ranking_service | [scripts/train_ranker.py](../scripts/train_ranker.py) |
+| 排序两级架构(Phase 8-D 显式化) | 召回(top_k=100)→ 粗排(规则分截 50)→ 精排(LightGBM 截 top_n);off/挂 → 粗排直截,与旧兜底语义等价 | [src/tools/deal_tools.cpp](../src/tools/deal_tools.cpp) |
 | 可观测(recommendation_logs/llm_calls) | 按规划落地 + 三口径(真实/测试/模拟)拆分 | [scripts/evaluate.py](../scripts/evaluate.py) |
 
 ## 二、替代实现及理由
