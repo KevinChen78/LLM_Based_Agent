@@ -1,6 +1,7 @@
 #pragma once
 
 #include "agent/common.hpp"
+#include "agent/service_circuit.hpp"
 #include "coro/core/task.hpp"
 
 #include <atomic>
@@ -97,6 +98,13 @@ private:
     std::string base_url_;
     std::string api_key_;
     std::atomic<bool> healthy_{true};
+    // Phase 9-A0: gateway-absence circuit breaker (shared implementation with
+    // the retrieval/ranker clients). A dead gateway costs ~2.05s per refused
+    // connect on Windows (×2 for localhost dual-stack); after breaker
+    // threshold consecutive transport failures, Chat/ChatStream fail fast
+    // into the existing fallback chain (planner default action / template
+    // reply) instead of re-paying the refusal tax on every turn.
+    ServiceCircuit circuit_;
 };
 
 } // namespace agent

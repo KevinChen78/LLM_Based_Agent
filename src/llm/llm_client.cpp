@@ -259,6 +259,13 @@ coro::Task<LlmClient::LlmStreamResult> HttpLlmClient::ChatStream(
         co_return out;
     }
 
+    // Phase 9-A0: fail fast while the breaker is open (dead gateway costs
+    // ~2.05s per refused connect on this platform).
+    if (!circuit_.AllowRequest()) {
+        spdlog::debug("LLM stream skipped: circuit open");
+        co_return out;   // streamed=false -> caller falls back
+    }
+
     nlohmann::json req_json;
     req_json["model"] = options.model;
     req_json["messages"] = nlohmann::json::array();
@@ -290,10 +297,12 @@ coro::Task<LlmClient::LlmStreamResult> HttpLlmClient::ChatStream(
     if (!ok) {
         spdlog::warn("LLM stream request failed (host={}:{})", url.host, url.port);
         healthy_ = false;
+        circuit_.ReportFailure();
         co_return out;   // streamed=false
     }
 
     healthy_ = true;
+    circuit_.ReportSuccess();
     out.text = std::move(accumulated);
     out.streamed = true;
     out.prompt_tokens = prompt_tokens;
@@ -413,6 +422,17 @@ coro::Task<LlmResponse> HttpLlmClient::Chat(
     }
 
     // Build OpenAI-compatible chat completion request
+    // Phase 9-A0: fail fast while the breaker is open (dead gateway costs
+    // ~2.05s per refused connect, ×2 for localhost dual-stack).
+    if (!circuit_.AllowRequest()) {
+        spdlog::debug("LLM Chat skipped: circuit open");
+        healthy_ = false;
+        resp.raw_text = R"({"action":"FALLBACK"})";
+        resp.latency = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+        co_return resp;
+    }
+
     nlohmann::json req_json;
     req_json["model"] = options.model;
     req_json["messages"] = nlohmann::json::array();
@@ -442,6 +462,7 @@ coro::Task<LlmResponse> HttpLlmClient::Chat(
         if (!res) {
             spdlog::error("LLM HTTP request failed: no response");
             healthy_ = false;
+            circuit_.ReportFailure();
             resp.raw_text = R"({"action":"FALLBACK"})";
             co_return resp;
         }
@@ -449,6 +470,7 @@ coro::Task<LlmResponse> HttpLlmClient::Chat(
         if (res->status != 200) {
             spdlog::error("LLM HTTP error: status={}, body={}", res->status, res->body);
             healthy_ = false;
+            circuit_.ReportFailure();
             resp.raw_text = R"({"action":"FALLBACK"})";
             co_return resp;
         }
@@ -463,9 +485,11 @@ coro::Task<LlmResponse> HttpLlmClient::Chat(
         resp.completion_tokens = j.value("usage", nlohmann::json::object()).value("completion_tokens", 0);
         resp.model = j.value("model", "");
         healthy_ = true;
+        circuit_.ReportSuccess();
     } catch (const std::exception& e) {
         spdlog::error("LLM HTTP exception: {}", e.what());
         healthy_ = false;
+        circuit_.ReportFailure();
         resp.raw_text = R"({"action":"FALLBACK"})";
     }
 
@@ -475,7 +499,9 @@ coro::Task<LlmResponse> HttpLlmClient::Chat(
 }
 
 bool HttpLlmClient::Healthy() const {
-    return healthy_.load();
+    // Phase 9-A0: an open breaker means "known dead" — report unhealthy so
+    // callers (composer) short-circuit to their fallback without probing.
+    return healthy_.load() && circuit_.AllowRequest();
 }
 
 } // namespace agent

@@ -151,6 +151,17 @@ int main() {
     // Set LLM_BASE_URL= (empty) to fall back to the built-in deterministic stub.
     const char* env_url = std::getenv("LLM_BASE_URL");
     std::string llm_base_url = env_url ? env_url : "http://localhost:8000";
+    // Phase 9-A0: make the unset-vs-empty distinction visible at startup —
+    // unset silently targets the gateway (dead gateway = ~4.1s/turn refusal
+    // tax until the breaker opens); empty string means the offline stub.
+    if (!env_url) {
+        std::cout << "LLM: LLM_BASE_URL unset, defaulting to gateway http://localhost:8000"
+                     " (set LLM_BASE_URL= empty for the offline stub)" << std::endl;
+    } else if (llm_base_url.empty()) {
+        std::cout << "LLM: offline stub mode (LLM_BASE_URL empty)" << std::endl;
+    } else {
+        std::cout << "LLM: gateway " << llm_base_url << std::endl;
+    }
     auto llm = std::make_shared<HttpLlmClient>(llm_base_url, "");
     auto planner = std::make_shared<TaskPlanner>(llm);
     auto tools = std::make_shared<ToolRegistry>();

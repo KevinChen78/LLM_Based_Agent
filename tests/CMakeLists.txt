@@ -15,6 +15,7 @@ add_executable(test_agent
     test_api_auth.cpp
     test_rate_limiter.cpp
     test_service_circuit.cpp
+    test_llm_circuit.cpp
 )
 
 target_link_libraries(test_agent PRIVATE
