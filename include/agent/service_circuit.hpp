@@ -21,9 +21,11 @@ namespace agent {
 //   2. Circuit breaker — after breaker_threshold consecutive transport
 //      failures the circuit opens for breaker_cooldown_ms: AllowRequest()
 //      returns false and callers fail fast into their local fallback without
-//      touching the network. After the cooldown a single half-open trial is
-//      allowed; its verdict re-closes (success) or re-opens (failure) the
-//      circuit via ReportSuccess/ReportFailure.
+//      touching the network. After the cooldown requests are allowed again
+//      (technically every concurrent caller passes until the first Report
+//      lands — at this scale that burst IS the recovery probe); its verdict
+//      re-closes (success) or re-opens (failure) via ReportSuccess /
+//      ReportFailure.
 //
 // Purely additive to the degradation chain: every fast-fail path lands in the
 // same local fallback the slow failure used to reach.

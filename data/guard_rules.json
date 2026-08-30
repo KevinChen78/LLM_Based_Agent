@@ -1,5 +1,5 @@
 {
-  "_comment": "SafetyGuard 规则外置(Phase 4-C)。缺文件/损坏时 api_server 使用内置默认,内容与本文件一致(行为逐字节不变)。各数组整体替换内置列表;max_input_chars 为输入超长阈值;fact_check_whitelist_user_amounts(Phase 8-C)为 true 时,事实校验对用户输入/会话槽位中出现过的金额数字放行(消除\"复述用户预算被判编造价格\"误杀,B 报告实测误杀率 33%)。",
+  "_comment": "SafetyGuard 规则外置(Phase 4-C)。缺文件/损坏时 api_server 使用内置默认(逐字节同 Phase 4 行为;例外:fact_check_whitelist_user_amounts 内置默认关,仅在本文件显式置 true 时启用)。各数组整体替换内置列表;max_input_chars 为输入超长阈值;fact_check_whitelist_user_amounts(Phase 8-C)为 true 时,事实校验对用户输入/会话槽位中出现过的金额数字放行(消除\"复述用户预算被判编造价格\"误杀,B 报告实测误杀率 33%)。",
   "max_input_chars": 500,
   "injection_patterns": [
     "ignore previous instructions",
