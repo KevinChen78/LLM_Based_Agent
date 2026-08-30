@@ -64,9 +64,17 @@ public:
     // per-person (price/people) and total (price*people) for people in the
     // item's own [min_people, max_people] range, and zhe-level discounts
     // (price/original_price*10). Rule-based, zero LLM calls.
+    //
+    // Phase 8-C: when `whitelist_user_amounts_` is enabled (rules-file key
+    // `fact_check_whitelist_user_amounts`), money numbers that already appear
+    // in `user_text` (current input + session slots, passed by the composer)
+    // are additionally allowed — the LLM echoing the user's own budget
+    // ("您 500 元的预算…") is not a fabricated price. Phase 8-B measured this
+    // false-positive pattern at a 33% guard-fallback rate on real traffic.
     FactCheckResult FactCheckReply(
         const std::string& reply,
-        const std::vector<RecommendationItem>& items) const;
+        const std::vector<RecommendationItem>& items,
+        const std::string& user_text = "") const;
 
     // Sanitize each item's reason / title in place.
     void SanitizeItems(std::vector<RecommendationItem>& items) const;
@@ -81,6 +89,10 @@ private:
     std::vector<std::string> banned_topics_;
     // Banned words to redact from output.
     std::vector<std::string> banned_output_words_;
+    // Phase 8-C: allow money numbers echoed from user input / session slots
+    // (rules-file key `fact_check_whitelist_user_amounts`; default off keeps
+    // the built-in behavior byte-identical to Phase 4 when no file exists).
+    bool whitelist_user_amounts_ = false;
 };
 
 } // namespace agent

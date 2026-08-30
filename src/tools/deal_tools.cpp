@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
 
 namespace agent {
@@ -392,6 +393,7 @@ coro::Task<ToolResult> DealRanker::Execute(const ToolCall& call) {
         std::string rank_mode = "rule";
         std::string model_version;
         bool model_served = false;
+        bool shadow_fired = false;
 
         if ((use_model || want_shadow) && !scored.empty()) {
             // Fine-rank input = the coarse-truncated set (order = coarse rank).
@@ -409,27 +411,46 @@ coro::Task<ToolResult> DealRanker::Execute(const ToolCall& call) {
                 {"top_n", top_n},
                 {"shadow", !use_model},
             };
-            auto resp = ranker_->Rank(req);
-            if (resp && resp->value("model_loaded", false) &&
-                resp->contains("items") && (*resp)["items"].is_array() &&
-                !(*resp)["items"].empty()) {
-                model_version = resp->value("model_version", "");
-                std::unordered_map<std::string, double> by_id;
-                for (const auto& it : (*resp)["items"]) {
-                    by_id[it.value("item_id", "")] = it.value("model_score", 0.0);
-                }
-                for (auto& s : scored) {
-                    auto it = by_id.find(s.deal.value("item_id", ""));
-                    if (it != by_id.end()) {
-                        s.model_score = it->second;
-                        s.has_model_score = true;
+            if (use_model) {
+                // Active/treatment: synchronous — model scores serve, so the
+                // caller must wait (rule fallback on any failure).
+                auto resp = ranker_->Rank(req);
+                if (resp && resp->value("model_loaded", false) &&
+                    resp->contains("items") && (*resp)["items"].is_array() &&
+                    !(*resp)["items"].empty()) {
+                    model_version = resp->value("model_version", "");
+                    std::unordered_map<std::string, double> by_id;
+                    for (const auto& it : (*resp)["items"]) {
+                        by_id[it.value("item_id", "")] = it.value("model_score", 0.0);
                     }
+                    for (auto& s : scored) {
+                        auto it = by_id.find(s.deal.value("item_id", ""));
+                        if (it != by_id.end()) {
+                            s.model_score = it->second;
+                            s.has_model_score = true;
+                        }
+                    }
+                    model_served = true;
                 }
-                model_served = use_model;
-            }
-            if (use_model && !model_served) {
-                rank_mode = "rule_fallback";
-                spdlog::warn("deal_ranker: model path failed, serving rule scores");
+                if (!model_served) {
+                    rank_mode = "rule_fallback";
+                    spdlog::warn("deal_ranker: model path failed, serving rule scores");
+                }
+            } else {
+                // Phase 8-C: shadow is fire-and-forget. Phase 8-B measured a
+                // dead ranker costing 2.03s/turn on the hot path with zero
+                // user-visible value (scores only fed the audit). The request
+                // now goes out on a detached thread and the response is not
+                // awaited: model scores no longer land in candidates_json
+                // (rank_mode stays "rule", audit records shadow_async=true).
+                shadow_fired = true;
+                std::thread([client = ranker_, req = std::move(req)]() mutable {
+                    try {
+                        (void)client->Rank(req);
+                    } catch (...) {
+                        // Fire-and-forget: nothing to fall back to here.
+                    }
+                }).detach();
             }
         }
         if (model_served) rank_mode = "model";
@@ -477,6 +498,9 @@ coro::Task<ToolResult> DealRanker::Execute(const ToolCall& call) {
             {"model_version", model_version},
             {"candidates", audit_candidates},
         };
+        // Phase 8-C: shadow is fire-and-forget — the request was dispatched
+        // asynchronously and its scores never reach this audit row.
+        if (shadow_fired) rank_audit["shadow_async"] = true;
 
         result.success = true;
         nlohmann::json out;

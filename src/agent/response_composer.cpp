@@ -193,7 +193,11 @@ coro::Task<RecommendationResult> ResponseComposer::Compose(
                     // trailing `replace` SSE event carrying the template
                     // reply (additive event; old frontends ignore it).
                     if (guard_) {
-                        const auto fc = guard_->FactCheckReply(sr.text, result.items);
+                        // Phase 8-C: user_request + slots carry the user's own
+                        // budget/people numbers — echoing them is not a
+                        // fabricated price claim (whitelist is rules-file gated).
+                        const auto fc = guard_->FactCheckReply(
+                            sr.text, result.items, user_request + " " + slots_str);
                         if (!fc.ok) {
                             info.status = "guard_fallback";
                             result.llm_calls.push_back(std::move(info));
@@ -260,7 +264,8 @@ coro::Task<RecommendationResult> ResponseComposer::Compose(
                 // the compose_mode records why (the LLM call itself is still
                 // audited as a success above the guard layer).
                 if (guard_) {
-                    const auto fc = guard_->FactCheckReply(*reply, result.items);
+                    const auto fc = guard_->FactCheckReply(
+                        *reply, result.items, user_request + " " + slots_str);
                     if (!fc.ok) {
                         info.status = "guard_fallback";
                         result.llm_calls.push_back(std::move(info));

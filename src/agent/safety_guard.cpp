@@ -106,6 +106,14 @@ SafetyGuard::SafetyGuard(const std::string& rules_path) {
         if (j.contains("max_input_chars") && j["max_input_chars"].is_number_unsigned()) {
             max_input_chars = j["max_input_chars"].get<std::size_t>();
         }
+        // Phase 8-C: money-claim whitelist for numbers echoed from the user's
+        // own input / session slots. Off by default (no-file behavior stays
+        // byte-identical to Phase 4).
+        if (j.contains("fact_check_whitelist_user_amounts") &&
+            j["fact_check_whitelist_user_amounts"].is_boolean()) {
+            whitelist_user_amounts_ =
+                j["fact_check_whitelist_user_amounts"].get<bool>();
+        }
         spdlog::info("SafetyGuard: loaded rule overrides from {}", rules_path);
     } catch (const std::exception& e) {
         injection_patterns_ = DefaultInjectionPatterns();
@@ -240,7 +248,8 @@ bool DiscountAllowed(double zhe, const std::vector<RecommendationItem>& items) {
 
 FactCheckResult SafetyGuard::FactCheckReply(
     const std::string& reply,
-    const std::vector<RecommendationItem>& items) const {
+    const std::vector<RecommendationItem>& items,
+    const std::string& user_text) const {
     FactCheckResult r;
     if (reply.empty()) return r;
 
@@ -249,13 +258,33 @@ FactCheckResult SafetyGuard::FactCheckReply(
         r.violations.push_back(what);
     };
 
+    // Phase 8-C: numbers from the user's own input / session slots (e.g. a
+    // stated budget) are legitimate content for the LLM to echo — they are
+    // not fabricated price claims. Extracted as plain digit runs; a money
+    // claim matching any of them (±0.01) is whitelisted. Off unless the
+    // rules file enables it.
+    std::vector<double> user_amounts;
+    if (whitelist_user_amounts_ && !user_text.empty()) {
+        static const std::regex kNum(R"(\d+(?:\.\d+)?)");
+        for (std::sregex_iterator m(user_text.begin(), user_text.end(), kNum), end;
+             m != end; ++m) {
+            user_amounts.push_back(std::stod((*m)[0].str()));
+        }
+    }
+    auto user_allowed = [&user_amounts](double v) {
+        for (double u : user_amounts) {
+            if (Nearly(v, u, 0.01)) return true;
+        }
+        return false;
+    };
+
     // ¥xx / xx元 — money claims. Matched on UTF-8 bytes (source is /utf-8).
     static const std::regex kMoney(R"((?:¥\s*(\d+(?:\.\d+)?))|(?:(\d+(?:\.\d+)?)\s*元))");
     for (std::sregex_iterator m(reply.begin(), reply.end(), kMoney), end;
          m != end; ++m) {
         const std::string num = (*m)[1].matched ? (*m)[1].str() : (*m)[2].str();
         const double v = std::stod(num);
-        if (!MoneyAllowed(v, items)) {
+        if (!MoneyAllowed(v, items) && !user_allowed(v)) {
             add_violation("money claim " + num + " not in candidate "
                           "price/original_price/derived set");
         }

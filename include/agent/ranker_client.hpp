@@ -1,5 +1,7 @@
 #pragma once
 
+#include "agent/service_circuit.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -32,7 +34,8 @@ public:
     // True when a base_url is configured (the service is expected to run).
     virtual bool Enabled() const;
 
-    // True when the service answers GET /v1/health. Updates the cached flag.
+    // True when the service answers GET /v1/health. Phase 8-C: TTL-cached
+    // verdict + circuit breaker fast fail — see ServiceCircuit.
     virtual bool Healthy();
 
     // POST /v1/rank with the given request body; returns the parsed response
@@ -46,6 +49,7 @@ protected:
 
     std::string base_url_;
     std::atomic<bool> healthy_{true};
+    ServiceCircuit circuit_;
 };
 
 } // namespace agent

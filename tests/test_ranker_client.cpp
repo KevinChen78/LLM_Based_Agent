@@ -5,6 +5,11 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <thread>
+
 using namespace agent;
 using json = nlohmann::json;
 
@@ -12,7 +17,9 @@ namespace {
 
 // Fake RankerClient that returns canned responses without any HTTP, so the
 // DealRanker can be tested offline (same pattern as test_kb.cpp's
-// FakeRetrievalClient).
+// FakeRetrievalClient). Phase 8-C: shadow mode calls Rank on a detached
+// thread, so rank_calls/last_request are synchronized and tests wait for the
+// async call via WaitForRankCall.
 class FakeRankerClient : public RankerClient {
 public:
     FakeRankerClient() : RankerClient("http://fake") {}
@@ -21,16 +28,38 @@ public:
     bool Healthy() override { return healthy; }
 
     std::optional<json> Rank(const json& request) override {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            last_request = request;
+        }
         ++rank_calls;
-        last_request = request;
         if (!rank_response.is_null()) return rank_response;
         return std::nullopt;
+    }
+
+    // Spin-wait (bounded) for the fire-and-forget shadow call to land.
+    bool WaitForRankCall(int expected, int timeout_ms = 2000) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (rank_calls.load() >= expected) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return rank_calls.load() >= expected;
+    }
+
+    json LastRequest() {
+        std::lock_guard<std::mutex> lk(mu);
+        return last_request;
     }
 
     bool enabled = true;
     bool healthy = true;
     json rank_response;   // null -> simulate transport failure
-    int rank_calls = 0;
+    std::atomic<int> rank_calls{0};
+
+private:
+    std::mutex mu;
     json last_request;
 };
 
@@ -85,7 +114,7 @@ TEST(RankerClientIntegration, ModelScoresServeTreatment) {
         {"candidates", Candidates()}, {"budget", 300.0}, {"top_n", 2},
         {"user_id", "u-treatment"}
     });
-    EXPECT_EQ(client->rank_calls, 1);
+    EXPECT_EQ(client->rank_calls.load(), 1);
     ASSERT_EQ(out["items"].size(), 2u);
     EXPECT_EQ(out["items"][0]["item_id"], "b");          // model prefers b
     EXPECT_DOUBLE_EQ(out["items"][0]["score"].get<double>(), 0.99);
@@ -98,9 +127,11 @@ TEST(RankerClientIntegration, ModelScoresServeTreatment) {
     EXPECT_TRUE(out["rank_audit"]["candidates"][0].contains("model_score"));
 }
 
-// Shadow mode: rule scores serve; the model is still called and its scores
-// land in rank_audit only.
-TEST(RankerClientIntegration, ShadowServesRulesButAuditsModel) {
+// Shadow mode (Phase 8-C): fire-and-forget — rule scores serve, the result
+// returns WITHOUT waiting for the model, and the audit carries
+// shadow_async=true with no model scores. The request still goes out on a
+// detached thread (waited for below).
+TEST(RankerClientIntegration, ShadowIsFireAndForget) {
     auto client = std::make_shared<FakeRankerClient>();
     client->rank_response = ModelResponse();
     DealRanker ranker(client, ExperimentManager(
@@ -110,17 +141,17 @@ TEST(RankerClientIntegration, ShadowServesRulesButAuditsModel) {
         {"candidates", Candidates()}, {"budget", 300.0}, {"top_n", 2},
         {"user_id", "u-shadow"}
     });
-    EXPECT_EQ(client->rank_calls, 1);
-    EXPECT_TRUE(client->last_request.value("shadow", false));
     ASSERT_EQ(out["items"].size(), 2u);
     EXPECT_EQ(out["items"][0]["item_id"], "a");          // rules prefer a
     EXPECT_EQ(out["rank_audit"]["rank_mode"], "rule");
-    // Model score present in audit even though it did not serve.
-    bool saw_model_score = false;
+    EXPECT_TRUE(out["rank_audit"].value("shadow_async", false));
+    // Model scores never reach the audit row on the async path.
     for (const auto& c : out["rank_audit"]["candidates"]) {
-        if (!c["model_score"].is_null()) saw_model_score = true;
+        EXPECT_TRUE(c["model_score"].is_null());
     }
-    EXPECT_TRUE(saw_model_score);
+    // The shadow request is still dispatched (service-side observability).
+    ASSERT_TRUE(client->WaitForRankCall(1));
+    EXPECT_TRUE(client->LastRequest().value("shadow", false));
 }
 
 // Transport failure on the model path: rule fallback, flagged in rank_mode.
@@ -166,7 +197,7 @@ TEST(RankerClientIntegration, OffModeSkipsService) {
         {"candidates", Candidates()}, {"budget", 300.0}, {"top_n", 2},
         {"user_id", "u-treatment"}
     });
-    EXPECT_EQ(client->rank_calls, 0);
+    EXPECT_EQ(client->rank_calls.load(), 0);
     EXPECT_EQ(out["items"][0]["item_id"], "a");
     EXPECT_EQ(out["rank_audit"]["rank_mode"], "rule");
     EXPECT_EQ(out["rank_audit"]["experiment_group"], "");
@@ -188,8 +219,8 @@ TEST(RankerClientIntegration, TabooFilteredBeforeModelCall) {
     });
     ASSERT_EQ(out["items"].size(), 1u);
     EXPECT_EQ(out["items"][0]["item_id"], "a");
-    ASSERT_EQ(client->rank_calls, 1);
-    for (const auto& c : client->last_request["candidates"]) {
+    ASSERT_EQ(client->rank_calls.load(), 1);
+    for (const auto& c : client->LastRequest()["candidates"]) {
         EXPECT_NE(c["item_id"], "b");
     }
 }

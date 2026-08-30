@@ -111,3 +111,14 @@ FROM recommendation_logs;
 - 单测 129/129(阶段 A +11、B +2、C +3 例;1 SKIP live-PG)。
 - e2e 离线 80/80(67 基线 + S9 13 项);stub 模板输出零误杀。
 - gRPC 变体(build-grpc,ENABLE_GRPC=ON)增量构建通过。
+
+## Phase 8-C 增补:用户金额白名单
+
+Phase 8-B 实测发现事实校验的明确误杀模式:LLM 复述**用户自己说的预算数字**
+(如"按您 500 元的预算…")被判"编造价格"(该数字不在候选商品价格/派生白名单中),
+真实流量误杀率 33%(11 例跨日复现,含纯知识问答)。
+
+修复:`data/guard_rules.json` 新增 `fact_check_whitelist_user_amounts`(默认 false,
+缺文件时行为与 Phase 4 逐字节一致);置 true 后,`FactCheckReply` 第三个参数
+(composer 传入"当前输入 + 会话槽位 JSON")里出现过的金额数字加入白名单。
+候选价格/派生白名单校验不变,编造价格(不在候选集也不在用户文本中)仍拦截。

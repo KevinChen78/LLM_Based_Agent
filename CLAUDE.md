@@ -99,6 +99,14 @@ off/挂/无模型→粗排名次直接截 top_n,语义同旧"规则分兜底")�
   无画像段(逐字节同无画像行为);`RETRIEVAL_PROTOCOL=grpc` 时 gRPC 失败
   逐调用回退 HTTP(再失败走原链);无 `ENABLE_GRPC` 编译时
   GrpcRetrievalClient 整体是 HTTP 直通。改任何一层都不能破坏降级链。
+- **服务韧性(Phase 8-C)**:`ServiceCircuit`(include/agent/service_circuit.hpp)
+  给 RetrievalClient/RankerClient 统一提供健康检查 TTL 缓存(成功/失败同缓存
+  30s,负缓存)+ 连败熔断(连续 2 次传输失败熔断 30s,熔断期 AllowRequest=false
+  直接走本地兜底,零网络探测;到期半开试探)。动机:本机 Windows 连接拒绝实测
+  ~2.05s/次,死服务场景每轮白付 ~6.1s(B 报告 §3)。shadow 模式同阶段改为
+  **fire-and-forget**(detached 线程发请求不等结果,活跃/active 路径仍同步;
+  代价:shadow 不再产出 candidates_json 的 model_score,审计记
+  `shadow_async=true`,用户已裁决接受)。
 - **DealCatalog 三源回退**:ctor `DealCatalog(json_path, pg_dsn="")`,
   pg_dsn 非空先经 libpq 直连 `groupbuy_items`(`AGENT_HAVE_LIBPQ` 编译开关,
   CMake `ENABLE_PG_CATALOG` 自动探测 `C:/Program Files/PostgreSQL/17` 并

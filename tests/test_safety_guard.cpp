@@ -223,3 +223,35 @@ TEST(SafetyGuardRules, RulesFileReplacesLists) {
     EXPECT_TRUE(g.CheckInput("哪里有赌博").is_safe);
     std::filesystem::remove(path);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 8-C: user-amount whitelist (rules-file gated)
+// ---------------------------------------------------------------------------
+
+TEST(SafetyGuardFactCheck, UserAmountWhitelistOffByDefault) {
+    SafetyGuard g;   // no rules file -> built-in default: whitelist OFF
+    const std::vector<RecommendationItem> items = {MakeFactItem(288, 480, 3, 4)};
+    // Echoing the user's budget is still a violation without the rules flag
+    // (byte-identical to Phase 4 behavior).
+    auto r = g.FactCheckReply("按您 500 元的预算，推荐这个套餐", items,
+                              "周末带家人吃火锅，4个人，北京，500预算");
+    EXPECT_FALSE(r.ok);
+}
+
+TEST(SafetyGuardFactCheck, UserAmountWhitelistAllowsEchoedBudget) {
+    const auto path = WriteTempRules("guard_rules_whitelist.json", R"({
+        "fact_check_whitelist_user_amounts": true
+    })");
+    SafetyGuard g(path.string());
+    const std::vector<RecommendationItem> items = {MakeFactItem(288, 480, 3, 4)};
+    // 500 appears only in the user text (session budget) — whitelisted.
+    // 288 / 480 pass via the normal candidate checks.
+    EXPECT_TRUE(g.FactCheckReply(
+        "按您 500 元的预算，推荐海鲜大咖：现价 288 元，原价 ¥480。",
+        items, "周末带家人吃火锅，4个人，北京，500预算").ok);
+    // A number nowhere in items NOR user text is still a violation.
+    auto r = g.FactCheckReply("只要 999 元", items, "500预算");
+    EXPECT_FALSE(r.ok);
+    EXPECT_NE(r.violations[0].find("999"), std::string::npos);
+    std::filesystem::remove(path);
+}
