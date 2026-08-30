@@ -126,6 +126,8 @@ void ObservabilityStore::InitSchema() {
     // Phase 4-C guard audit columns.
     add_column_if_missing("recommendation_logs", "guard_action", "TEXT");
     add_column_if_missing("recommendation_logs", "guard_detail", "TEXT");
+    // Phase 8-A per-stage latency map.
+    add_column_if_missing("recommendation_logs", "stage_ms_json", "TEXT");
     exec(R"(
         CREATE TABLE IF NOT EXISTS llm_calls (
             rowid             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -154,8 +156,8 @@ void ObservabilityStore::LogRecommendation(const RecLogEntry& e) {
             "(trace_id, session_id, user_id, request_text, action, slots_json, "
             " item_count, ranked_items, response_text, grounding_count, compose_mode, "
             " latency_ms, created_at, candidates_json, experiment_group, rank_mode, "
-            " guard_action, guard_detail) "
-            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            " guard_action, guard_detail, stage_ms_json) "
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             -1, &raw, nullptr) != SQLITE_OK) {
         spdlog::warn("LogRecommendation prepare failed: {}", sqlite3_errmsg(db_));
         return;
@@ -180,6 +182,7 @@ void ObservabilityStore::LogRecommendation(const RecLogEntry& e) {
     sqlite3_bind_text(raw, 16, e.rank_mode.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(raw, 17, e.guard_action.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(raw, 18, e.guard_detail.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(raw, 19, e.stage_ms_json.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(raw) != SQLITE_DONE) {
         // Audit writes must never break the recommendation path.
         spdlog::warn("LogRecommendation insert failed: {}", sqlite3_errmsg(db_));

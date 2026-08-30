@@ -40,6 +40,9 @@ public:
         // Guard audit (Phase 4-C); empty = no guard intervention.
         std::string guard_action;      // refuse_input / sanitized / fact_violation / ""
         std::string guard_detail;      // violation summary / risk type (capped)
+        // Phase 8-A per-stage latency map (JSON object: scalar stages in ms,
+        // "tools": [{name, ms}], planner_attempts); empty on old rows.
+        std::string stage_ms_json;
     };
 
     struct LlmCallEntry {

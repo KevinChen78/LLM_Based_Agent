@@ -60,6 +60,7 @@ private:
         std::string slots_json;
         std::string rank_audit_json;         // ranker tool's rank_audit object (Phase 2.1)
         std::string recall_audit_json;       // retriever's recall_audit object (Phase 3-C)
+        std::string stage_ms_json;           // per-stage latency map (Phase 8-A)
     };
 
     coro::Task<RecommendationResult> ChatStreamInner(

@@ -114,6 +114,71 @@ std::string FormatPassage(const nlohmann::json& p) {    std::string title = p.va
     return s;
 }
 
+// Phase 8-A: per-stage latency probe. Mark() stamps ms-since-previous-mark
+// under a stage name; tool timings accumulate as a list. The JSON rides the
+// audit channel into recommendation_logs.stage_ms_json (additive column;
+// steady_clock local reads are ns-scale, so the probe itself is noise-free).
+class StageTimer {
+public:
+    StageTimer() : last_(std::chrono::steady_clock::now()) {}
+
+    void Mark(const std::string& name) {
+        const auto now = std::chrono::steady_clock::now();
+        stages_[name] = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - last_).count();
+        last_ = now;
+    }
+    void Set(const std::string& name, long long ms) { stages_[name] = ms; }
+    void AddToolMs(const std::string& name, long long ms) {
+        tools_.push_back({{"name", name}, {"ms", ms}});
+    }
+    std::string ToJson() const {
+        nlohmann::json j = stages_;
+        if (!tools_.empty()) j["tools"] = tools_;
+        return j.dump();
+    }
+
+private:
+    std::chrono::steady_clock::time_point last_;
+    nlohmann::json stages_ = nlohmann::json::object();
+    nlohmann::json tools_ = nlohmann::json::array();
+};
+
+// Phase 8-A: wraps the compose emitter to timestamp the first streamed delta
+// (SSE first token) while forwarding every byte unchanged.
+class FirstTokenProbe : public StreamEmitter {
+public:
+    FirstTokenProbe(std::shared_ptr<StreamEmitter> inner,
+                    std::chrono::steady_clock::time_point compose_start)
+        : inner_(std::move(inner)), compose_start_(compose_start) {}
+
+    void Emit(const std::string& event_type,
+              const nlohmann::json& payload) override {
+        inner_->Emit(event_type, payload);
+    }
+    void EmitDelta(const std::string& text_delta) override {
+        if (!first_seen_) {
+            first_seen_ = true;
+            first_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - compose_start_).count();
+        }
+        inner_->EmitDelta(text_delta);
+    }
+    void Finish(const RecommendationResult& result) override { inner_->Finish(result); }
+    void Error(const std::string& message) override { inner_->Error(message); }
+    bool IsClosed() const override { return inner_->IsClosed(); }
+
+    // ms from compose start to first delta; -1 when nothing was streamed
+    // (template / short-circuit compose modes emit no deltas).
+    long long first_ms() const { return first_seen_ ? first_ms_ : -1; }
+
+private:
+    std::shared_ptr<StreamEmitter> inner_;
+    std::chrono::steady_clock::time_point compose_start_;
+    bool first_seen_ = false;
+    long long first_ms_ = 0;
+};
+
 } // namespace
 
 AgentOrchestrator::AgentOrchestrator(
@@ -188,6 +253,7 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStream(
         e.compose_mode = result.compose_mode.empty() ? "none" : result.compose_mode;
         e.guard_action = result.guard_action;
         e.guard_detail = result.guard_detail;
+        e.stage_ms_json = audit.stage_ms_json;   // Phase 8-A per-stage latency
         e.latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start).count();
         // Learning-to-rank audit fields (Phase 2.1). Fire-and-forget: any
@@ -229,6 +295,11 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
     Request req, std::shared_ptr<StreamEmitter> emitter, RecAudit* audit) {
     RecommendationResult result;
     result.trace_id = GenerateTraceId();
+    // Phase 8-A: stage timings ride the audit channel; fire-and-forget.
+    StageTimer stage_timer;
+    auto flush_stages = [&stage_timer, audit]() {
+        if (audit) audit->stage_ms_json = stage_timer.ToJson();
+    };
 
     try {
         // 1. Get or create session
@@ -236,6 +307,7 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
             req.user_context.session_id.empty() ? std::optional<std::string>{} : req.user_context.session_id,
             req.user_context);
         result.session_id = session.session_id;
+        stage_timer.Mark("session_load");
         EmitIf(emitter, "started", nlohmann::json{
             {"session_id", session.session_id},
             {"state", session.current_state}
@@ -245,8 +317,7 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
         if (guard_) {
             EmitIf(emitter, "input_guard", nlohmann::json{{"status", "checking"}});
             auto guard_result = guard_->CheckInput(req.user_message);
-            if (!guard_result.is_safe) {
-                spdlog::warn("Input blocked: risk_type={}, reason={}",
+            if (!guard_result.is_safe) {                spdlog::warn("Input blocked: risk_type={}, reason={}",
                              guard_result.risk_type, guard_result.reason);
                 result.response_text = guard_result.refusal_reply;
                 result.next_state = "BLOCKED";
@@ -263,11 +334,14 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
                     ConversationTurn{.role = "user", .content = req.user_message});
                 co_await memory_->AppendTurn(session.session_id,
                     ConversationTurn{.role = "assistant", .content = result.response_text});
+                stage_timer.Mark("input_guard");
+                flush_stages();
                 FinishIf(emitter, result);
                 co_return result;
             }
             EmitIf(emitter, "input_guard", nlohmann::json{{"status", "safe"}});
         }
+        stage_timer.Mark("input_guard");
 
         // 3. Append user turn
         ConversationTurn user_turn;
@@ -277,12 +351,14 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
 
         // 4. Retrieve history
         auto history = co_await memory_->GetRecentTurns(session.session_id, 10);
+        stage_timer.Mark("history_load");   // covers the user-turn append too
 
         // 5. Plan next step (with the cross-session user profile, Phase 2.2 —
         // empty object when profiles are unwired/anonymous/no signals).
         EmitIf(emitter, "planning", nlohmann::json{{"detail", "deciding next step"}});
         const nlohmann::json user_profile = ResolveUserProfile(
             profiles_.get(), catalog_.get(), req.user_context.user_id);
+        stage_timer.Mark("profile_resolve");
         // Phase 3-A: ground the planner's category slot in the catalog's real
         // vocabulary. Empty when no catalog is wired (prompt unchanged).
         std::string category_list;
@@ -296,8 +372,14 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
         auto plan = co_await planner_->PlanNextStep(
             req.user_context, history, req.user_message, session.context,
             user_profile, category_list);
+        stage_timer.Mark("planner_llm");
         if (audit) {
             audit->slots_json = plan.slots.dump();
+            long long plan_attempts = 0;
+            for (const auto& c : plan.llm_calls) {
+                if (c.purpose == "plan") ++plan_attempts;
+            }
+            stage_timer.Set("planner_attempts", plan_attempts);
             for (auto& c : plan.llm_calls) audit->llm_calls.push_back(std::move(c));
         }
 
@@ -316,9 +398,16 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
             } else {
                 result.response_text = "请问您能提供更多信息吗？例如城市、人数和预算。";
             }
-            co_await memory_->UpdateContext(session.session_id, "SLOT_FILL", plan.slots);
-            co_await memory_->AppendTurn(session.session_id,
-                ConversationTurn{.role = "assistant", .content = result.response_text});
+            {
+                const auto save_start = std::chrono::steady_clock::now();
+                co_await memory_->UpdateContext(session.session_id, "SLOT_FILL", plan.slots);
+                co_await memory_->AppendTurn(session.session_id,
+                    ConversationTurn{.role = "assistant", .content = result.response_text});
+                stage_timer.Set("session_save",
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - save_start).count());
+            }
+            flush_stages();
             FinishIf(emitter, result);
             co_return result;
         }
@@ -330,9 +419,16 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
             result.response_text = plan.direct_response.empty()
                 ? "您好，我可以帮您推荐团购套餐，请告诉我城市、人数和预算。"
                 : plan.direct_response;
-            co_await memory_->UpdateContext(session.session_id, "RESPOND", plan.slots);
-            co_await memory_->AppendTurn(session.session_id,
-                ConversationTurn{.role = "assistant", .content = result.response_text});
+            {
+                const auto save_start = std::chrono::steady_clock::now();
+                co_await memory_->UpdateContext(session.session_id, "RESPOND", plan.slots);
+                co_await memory_->AppendTurn(session.session_id,
+                    ConversationTurn{.role = "assistant", .content = result.response_text});
+                stage_timer.Set("session_save",
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - save_start).count());
+            }
+            flush_stages();
             FinishIf(emitter, result);
             co_return result;
         }
@@ -397,7 +493,11 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
                 {"call_id", call.call_id},
                 {"chained", injected}
             });
+            auto tool_start = std::chrono::steady_clock::now();
             auto tool_result = co_await tool->Execute(effective);
+            stage_timer.AddToolMs(call.tool_name,
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - tool_start).count());
             spdlog::info("Tool {} result: success={}, result={}", call.tool_name, tool_result.success, tool_result.result_json);
             EmitIf(emitter, "tool_result", nlohmann::json{
                 {"tool_name", call.tool_name},
@@ -482,8 +582,23 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
         }
 
         EmitIf(emitter, "composing", nlohmann::json{{"detail", "generating reply"}});
+        // Phase 8-A: probe wraps the emitter to timestamp the first streamed
+        // delta; non-stream/template modes simply report no first token.
+        const auto compose_start = std::chrono::steady_clock::now();
+        std::shared_ptr<FirstTokenProbe> probe;
+        std::shared_ptr<StreamEmitter> compose_emitter = emitter;
+        if (emitter) {
+            probe = std::make_shared<FirstTokenProbe>(emitter, compose_start);
+            compose_emitter = probe;
+        }
         auto composed = co_await composer_->Compose(
-            req.user_message, plan.slots, items, emitter, grounding_text);
+            req.user_message, plan.slots, items, compose_emitter, grounding_text);
+        stage_timer.Set("compose_total",
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - compose_start).count());
+        if (probe && probe->first_ms() >= 0) {
+            stage_timer.Set("compose_first_token", probe->first_ms());
+        }
         result.response_text = composed.response_text;
         result.items = std::move(composed.items);
         result.compose_mode = composed.compose_mode;
@@ -496,6 +611,7 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
 
         // 9. Output safety guard: mask PII / strip banned words before returning.
         if (guard_) {
+            const auto guard_start = std::chrono::steady_clock::now();
             const std::string before = result.response_text;
             result.response_text = guard_->SanitizeOutputText(result.response_text);
             guard_->SanitizeItems(result.items);
@@ -505,17 +621,28 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
                 result.guard_action = "sanitized";
                 result.guard_detail = "pii/banned words redacted from reply";
             }
+            stage_timer.Set("guard_post",
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - guard_start).count());
         }
 
         // 10. Update context and store assistant turn
-        co_await memory_->UpdateContext(session.session_id, "RESPOND", plan.slots);
-        co_await memory_->AppendTurn(session.session_id,
-            ConversationTurn{.role = "assistant", .content = result.response_text});
+        {
+            const auto save_start = std::chrono::steady_clock::now();
+            co_await memory_->UpdateContext(session.session_id, "RESPOND", plan.slots);
+            co_await memory_->AppendTurn(session.session_id,
+                ConversationTurn{.role = "assistant", .content = result.response_text});
+            stage_timer.Set("session_save",
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - save_start).count());
+        }
 
+        flush_stages();
         FinishIf(emitter, result);
         co_return result;
     } catch (const std::exception& e) {
         spdlog::error("AgentOrchestrator::ChatStream error: {}", e.what());
+        flush_stages();
         if (emitter) {
             emitter->Error(std::string("internal error: ") + e.what());
         }

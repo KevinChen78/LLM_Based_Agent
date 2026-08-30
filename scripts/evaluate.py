@@ -293,6 +293,63 @@ def main():
             for r in fv:
                 print(f"    [{r['t']}] ({r['m']}) {(r['d'] or '')[:100]}")
 
+    # ---- 分阶段延迟（Phase 8-A；旧库无此列则整段跳过）----
+    if "stage_ms_json" in cols:
+        rows = q("SELECT stage_ms_json s, COALESCE(NULLIF(compose_mode,''),'none') m, "
+                 "latency_ms l FROM recommendation_logs "
+                 "WHERE stage_ms_json IS NOT NULL AND stage_ms_json != ''")
+        if rows:
+            import json as _json
+            print(f"\n■ 分阶段延迟（Phase 8，{len(rows)} 行带埋点）")
+            # Scalar stages per compose_mode group; tools aggregated globally.
+            SCALARS = ["session_load", "input_guard", "history_load",
+                       "profile_resolve", "planner_llm", "planner_attempts",
+                       "compose_first_token", "compose_total", "guard_post",
+                       "session_save"]
+            by_mode = {}
+            tool_ms = {}
+            cover = []
+            for r in rows:
+                try:
+                    j = _json.loads(r["s"])
+                except ValueError:
+                    continue
+                g = by_mode.setdefault(r["m"], {k: [] for k in SCALARS})
+                for k in SCALARS:
+                    if k in j and isinstance(j[k], (int, float)):
+                        g[k].append(j[k])
+                for t in j.get("tools", []):
+                    tool_ms.setdefault(t.get("name", "?"), []).append(
+                        t.get("ms", 0))
+                stage_sum = sum(v for k, v in j.items()
+                                if k != "tools" and isinstance(v, (int, float))
+                                and k != "planner_attempts")
+                stage_sum += sum(t.get("ms", 0) for t in j.get("tools", []))
+                if r["l"]:
+                    cover.append(stage_sum / r["l"])
+            if cover:
+                print(f"  埋点覆盖率(stage 合计 / 端到端): avg {sum(cover)/len(cover)*100:.1f}%"
+                      f" (越接近 100% 说明归因越完整)")
+            for mode in sorted(by_mode):
+                g = by_mode[mode]
+                print(f"  compose_mode={mode} (n={max((len(v) for v in g.values()), default=0)})")
+                for k in SCALARS:
+                    vals = sorted(g[k])
+                    if not vals:
+                        continue
+                    if k == "planner_attempts":  # 计数,非耗时
+                        print(f"    {k:<20} p50 {percentile(vals, 0.5):>6} 次 | "
+                              f"p95 {percentile(vals, 0.95):>6} 次 | max {vals[-1]:>6} 次")
+                        continue
+                    print(f"    {k:<20} p50 {percentile(vals, 0.5):>6} ms | "
+                          f"p95 {percentile(vals, 0.95):>6} ms | max {vals[-1]:>6} ms")
+            if tool_ms:
+                print("  工具耗时（全部行聚合）:")
+                for name, vals in sorted(tool_ms.items()):
+                    vals = sorted(vals)
+                    print(f"    {name:<20} n={len(vals):>3} | p50 {percentile(vals, 0.5):>6} ms | "
+                          f"p95 {percentile(vals, 0.95):>6} ms | max {vals[-1]:>6} ms")
+
     con.close()
     print("\n" + "=" * 60)
     return 0
