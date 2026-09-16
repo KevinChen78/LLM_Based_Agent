@@ -24,6 +24,12 @@ namespace agent {
 
 namespace {
 
+// Named state strings for UpdateContext — passing a string literal there would
+// create a temporary std::string bound to the coroutine's const-ref parameter,
+// which GCC 11/12 double-destroys when the co_await spans a suspension.
+const std::string kStateSlotFill = "SLOT_FILL";
+const std::string kStateRespond = "RESPOND";
+
 std::string GenerateTraceId() {
     static std::atomic<int> counter{0};
     auto now = std::chrono::system_clock::now().time_since_epoch().count();
@@ -303,9 +309,14 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
 
     try {
         // 1. Get or create session
-        auto session = co_await memory_->GetOrCreateSession(
-            req.user_context.session_id.empty() ? std::optional<std::string>{} : req.user_context.session_id,
-            req.user_context);
+        // NOTE: hoist the optional into a named local — GCC 11/12 coroutine
+        // code destroys heap-backed temporaries spanning a co_await twice
+        // (double-free at frame teardown on Linux; MSVC builds never noticed).
+        const std::optional<std::string> session_id_opt =
+            req.user_context.session_id.empty()
+                ? std::optional<std::string>{}
+                : std::optional<std::string>{req.user_context.session_id};
+        auto session = co_await memory_->GetOrCreateSession(session_id_opt, req.user_context);
         result.session_id = session.session_id;
         stage_timer.Mark("session_load");
         EmitIf(emitter, "started", nlohmann::json{
@@ -330,10 +341,16 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
                     {"reason", guard_result.reason}
                 });
                 // Record both turns so the transcript stays coherent.
-                co_await memory_->AppendTurn(session.session_id,
-                    ConversationTurn{.role = "user", .content = req.user_message});
-                co_await memory_->AppendTurn(session.session_id,
-                    ConversationTurn{.role = "assistant", .content = result.response_text});
+                // NOTE: named locals, not designated-initializer temporaries —
+                // GCC 11/12 destroys heap-backed co_await temporaries twice.
+                ConversationTurn guard_user_turn;
+                guard_user_turn.role = "user";
+                guard_user_turn.content = req.user_message;
+                ConversationTurn guard_reply_turn;
+                guard_reply_turn.role = "assistant";
+                guard_reply_turn.content = result.response_text;
+                co_await memory_->AppendTurn(session.session_id, guard_user_turn);
+                co_await memory_->AppendTurn(session.session_id, guard_reply_turn);
                 stage_timer.Mark("input_guard");
                 flush_stages();
                 FinishIf(emitter, result);
@@ -400,9 +417,11 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
             }
             {
                 const auto save_start = std::chrono::steady_clock::now();
-                co_await memory_->UpdateContext(session.session_id, "SLOT_FILL", plan.slots);
-                co_await memory_->AppendTurn(session.session_id,
-                    ConversationTurn{.role = "assistant", .content = result.response_text});
+                co_await memory_->UpdateContext(session.session_id, kStateSlotFill, plan.slots);
+                ConversationTurn clarify_turn;
+                clarify_turn.role = "assistant";
+                clarify_turn.content = result.response_text;
+                co_await memory_->AppendTurn(session.session_id, clarify_turn);
                 stage_timer.Set("session_save",
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - save_start).count());
@@ -421,9 +440,11 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
                 : plan.direct_response;
             {
                 const auto save_start = std::chrono::steady_clock::now();
-                co_await memory_->UpdateContext(session.session_id, "RESPOND", plan.slots);
-                co_await memory_->AppendTurn(session.session_id,
-                    ConversationTurn{.role = "assistant", .content = result.response_text});
+                co_await memory_->UpdateContext(session.session_id, kStateRespond, plan.slots);
+                ConversationTurn fallback_turn;
+                fallback_turn.role = "assistant";
+                fallback_turn.content = result.response_text;
+                co_await memory_->AppendTurn(session.session_id, fallback_turn);
                 stage_timer.Set("session_save",
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - save_start).count());
@@ -629,9 +650,11 @@ coro::Task<RecommendationResult> AgentOrchestrator::ChatStreamInner(
         // 10. Update context and store assistant turn
         {
             const auto save_start = std::chrono::steady_clock::now();
-            co_await memory_->UpdateContext(session.session_id, "RESPOND", plan.slots);
-            co_await memory_->AppendTurn(session.session_id,
-                ConversationTurn{.role = "assistant", .content = result.response_text});
+            co_await memory_->UpdateContext(session.session_id, kStateRespond, plan.slots);
+            ConversationTurn reply_turn;
+            reply_turn.role = "assistant";
+            reply_turn.content = result.response_text;
+            co_await memory_->AppendTurn(session.session_id, reply_turn);
             stage_timer.Set("session_save",
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - save_start).count());

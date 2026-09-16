@@ -174,9 +174,14 @@ coro::Task<RecommendationResult> ResponseComposer::Compose(
                 // Reasoning models burn tokens on reasoning before prose; give
                 // the reply ample room (the 1024 default truncated outputs).
                 options.max_tokens = 2048;
-                auto sr = co_await llm_->ChatStream(
-                    messages, options,
-                    [&emitter](const std::string& d) { emitter->EmitDelta(d); });
+                // NOTE: hoist the callback into a named local — binding a
+                // lambda-converted std::function temporary to the coroutine's
+                // const-ref parameter triggers a GCC 11/12 bug where
+                // heap-backed temporaries spanning a co_await are destroyed
+                // twice at frame teardown (double-free crash on Linux).
+                const LlmClient::DeltaCallback on_delta =
+                    [&emitter](const std::string& d) { emitter->EmitDelta(d); };
+                auto sr = co_await llm_->ChatStream(messages, options, on_delta);
                 // Token usage arrives in the trailing SSE usage chunk when the
                 // gateway gets it from the upstream (or the stub's estimate);
                 // it stays 0 when the upstream sends none — recorded honestly.

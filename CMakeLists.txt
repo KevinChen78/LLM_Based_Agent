@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.25)
-project(LLM_Based_Agent VERSION 0.1.0 LANGUAGES CXX)
+# C++20 is required for coroutines; C is needed for the sqlite3 amalgamation
+# (the VS generator initializes C implicitly, Makefile/Ninja generators do not —
+# without this the Linux build fails with CMAKE_C_COMPILE_OBJECT unset).
+project(LLM_Based_Agent VERSION 0.1.0 LANGUAGES C CXX)
 
 # C++20 is required for coroutines
 set(CMAKE_CXX_STANDARD 20)

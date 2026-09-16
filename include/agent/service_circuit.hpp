@@ -37,7 +37,10 @@ public:
         int breaker_cooldown_ms = 30000;  // open duration before half-open trial
     };
 
-    explicit ServiceCircuit(Config cfg = {}) : cfg_(cfg) {}
+    // NOTE: no default argument here — GCC <12 rejects `Config cfg = {}` for a
+    // nested struct with NSDMIs (GCC bug 88165), and the Linux build uses g++ 11.
+    ServiceCircuit() : cfg_(Config{}) {}
+    explicit ServiceCircuit(Config cfg) : cfg_(cfg) {}
 
     // True when a request may hit the network right now. False while the
     // circuit is open — the caller must fail fast into its local fallback.
